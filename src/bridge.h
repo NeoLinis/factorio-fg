@@ -27,6 +27,11 @@ namespace bridge
 		float motion_hysteresis = 0.05f;
 		float motion_strictness = 0.5f;  // see motion::settings
 		bool motion_debug_view = false;
+		bool fg_debug_view = false;  // FSR's own debug view
+		bool fg_show_ui_layer = false; // FSR: show the extracted GUI layer (diagnostic)
+		bool fg_hold_character = true; // FSR: the held character from the newest real frame (no blended poses)
+		bool fg_inpaint_character = false; // FSR: and painted over in what FSR interpolates (ground only)
+		bool fg_only_generated = false;    // FSR: present only the generated frames (diagnostic)
 		float motion_far_penalty = 0.1f;
 		float motion_still_zone = 0.25f;
 		bool motion_mover_search = true;
@@ -82,6 +87,9 @@ namespace bridge
 	const char *status();
 	// Frame generation status (why it is unavailable, or the live DLSS-G state).
 	const char *fg_status();
+	// Frame generation in use: "DLSS-G", "FSR" or "none", and the largest multiplier it supports.
+	const char *backend_name();
+	uint32_t max_multiplier();
 	// Frames shown per Factorio frame (1 without frame generation), 0 if the bridge is not presenting.
 	uint32_t frames_per_present();
 	// Motion estimation status (camera shift and match quality).

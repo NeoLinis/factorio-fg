@@ -24,6 +24,7 @@
 #include "bridge.h"
 #include "motion.h"
 #include "layer_learn.h"
+#include "fg.h"
 #include "version.h"
 #include "setup_check.h"
 #include <algorithm>
@@ -298,6 +299,11 @@ namespace
 	bool g_anchor_ever_matched = false;
 	uint64_t g_game_frames = 0;      // Factorio frames since start
 	bool g_motion_debug = false;   // not saved: a diagnostic
+	bool g_fsr_debug = false;      // FSR's own debug view; not saved
+	bool g_fsr_ui_layer = false;   // FSR: show the extracted GUI layer; not saved
+	bool g_fsr_only_generated = false; // FSR: present only the generated frames; not saved
+	bool g_fsr_hold = true;        // FSR: the character from the newest real frame in generated frames
+	bool g_fsr_inpaint = false;    // and painted over (with what is under it) in what frame generation blends (option)
 #ifdef FG_RELEASE
 	bool g_osd = false;              // readout drawn on the bridge picture (hotkey)
 #else
@@ -314,6 +320,11 @@ namespace
 	LARGE_INTEGER g_fps_window_start = {};
 	uint32_t g_fps_window_frames = 0;
 	float g_base_fps = 0.0f;
+	// Frame generation technology: 0 automatic (DLSS-G on NVIDIA when installed, else FSR), 1 DLSS-G, 2 FSR. Applied when
+	// the bridge starts; changing it restarts the bridge.
+	bool g_capture_mode_migrated = false; // load_config turned a saved "Off" capture mode into the built-in rule
+	int g_fg_choice = 0;
+	int g_fg_choice_applied = -1; // the choice the running bridge was started with
 	bool g_bridge_failed = false;   // init failed once; do not retry every frame until toggled again
 	bool g_overlay_open = false;
 	bool g_auto_pending = false, g_auto_captured = false;
@@ -392,7 +403,8 @@ namespace
 		const int target = g_auto_target > 0 ? g_auto_target : (g_display_hz > 0 ? g_display_hz : 60);
 		if (g_base_fps < 5.0f)
 			return; // loading, paused rendering: keep the current choice
-		const int wanted = std::clamp(static_cast<int>(static_cast<float>(target) / g_base_fps + 0.03f), 1, 4);
+		const int wanted = std::clamp(static_cast<int>(static_cast<float>(target) / g_base_fps + 0.03f), 1,
+			static_cast<int>(bridge::max_multiplier())); // FSR: 2x
 		if (wanted == g_auto_multiplier)
 		{
 			g_auto_candidate_windows = 0;
@@ -413,13 +425,23 @@ namespace
 
 	int effective_multiplier()
 	{
-		return g_fg_multiplier == 0 ? g_auto_multiplier : g_fg_multiplier;
+		const int wanted = g_fg_multiplier == 0 ? g_auto_multiplier : g_fg_multiplier;
+		return std::min(wanted, static_cast<int>(bridge::max_multiplier())); // FSR: 2x
 	}
 
 	void load_config()
 	{
-		int mode = 0;
+		// Default: the built-in rule. (Up to 1.1.0 beta 4 a missing key meant Off, so the GUI was never kept out of the
+		// HUD-less copy on fresh installs and that Off got saved with the next setting change: undo that once.)
+		int mode = static_cast<int>(boundary_mode::after_anchor);
 		reshade::get_config_value(nullptr, CONFIG_SECTION, "Mode", mode);
+		bool mode_checked = false;
+		reshade::get_config_value(nullptr, CONFIG_SECTION, "CaptureModeChecked", mode_checked);
+		if (!mode_checked && mode == static_cast<int>(boundary_mode::off))
+		{
+			mode = static_cast<int>(boundary_mode::after_anchor);
+			g_capture_mode_migrated = true;
+		}
 		g_mode = static_cast<boundary_mode>(std::clamp(mode, 0, 5));
 		char hex[32] = {}; size_t len = sizeof(hex) - 1;
 		if (reshade::get_config_value(nullptr, CONFIG_SECTION, "RulePixelShader", hex, &len))
@@ -454,6 +476,10 @@ namespace
 		reshade::get_config_value(nullptr, CONFIG_SECTION, "DeveloperTools", g_dev_tools);
 		reshade::get_config_value(nullptr, CONFIG_SECTION, "MoverSearch", g_mover_search);
 		reshade::get_config_value(nullptr, CONFIG_SECTION, "WorldLayers", g_world_layers);
+		reshade::get_config_value(nullptr, CONFIG_SECTION, "FrameGenerationBackend", g_fg_choice);
+		reshade::get_config_value(nullptr, CONFIG_SECTION, "FsrHoldCharacter", g_fsr_hold);
+		reshade::get_config_value(nullptr, CONFIG_SECTION, "PaintOverCharacter", g_fsr_inpaint);
+		g_fg_choice = std::clamp(g_fg_choice, 0, 2);
 		{
 			char hexbuf[16] = {}; size_t hn = sizeof(hexbuf) - 1;
 			if (reshade::get_config_value(nullptr, CONFIG_SECTION, "LayerGroundPixelShader", hexbuf, &hn))
@@ -542,6 +568,7 @@ namespace
 	void save_config()
 	{
 		reshade::set_config_value(nullptr, CONFIG_SECTION, "Mode", static_cast<int>(g_mode));
+		reshade::set_config_value(nullptr, CONFIG_SECTION, "CaptureModeChecked", true);
 		char hex[16];
 		std::snprintf(hex, sizeof(hex), "%08X", g_rule_ps);
 		reshade::set_config_value(nullptr, CONFIG_SECTION, "RulePixelShader", static_cast<const char *>(hex));
@@ -574,6 +601,9 @@ namespace
 		reshade::set_config_value(nullptr, CONFIG_SECTION, "DeveloperTools", g_dev_tools);
 		reshade::set_config_value(nullptr, CONFIG_SECTION, "MoverSearch", g_mover_search);
 		reshade::set_config_value(nullptr, CONFIG_SECTION, "WorldLayers", g_world_layers);
+		reshade::set_config_value(nullptr, CONFIG_SECTION, "FrameGenerationBackend", g_fg_choice);
+		reshade::set_config_value(nullptr, CONFIG_SECTION, "FsrHoldCharacter", g_fsr_hold);
+		reshade::set_config_value(nullptr, CONFIG_SECTION, "PaintOverCharacter", g_fsr_inpaint);
 		{
 			char hexbuf[16];
 			std::snprintf(hexbuf, sizeof(hexbuf), "%08X", g_layer_ground_ps);
@@ -734,6 +764,11 @@ namespace
 		{
 			load_config();
 			g_config_loaded = true;
+			if (g_capture_mode_migrated)
+			{
+				log_info("HUD-less probe: GUI capture rule was saved as Off (default bug before 1.1.0 beta 5); switched to the built-in rule");
+				save_config();
+			}
 		}
 		destroy_swapchain_resources(dev);
 		g_device = dev;
@@ -812,6 +847,8 @@ namespace
 		}
 		if (bridge::active() && bridge::suspended())
 			bridge::suspend(false);
+		// Another technology chosen while the bridge runs: it applies at the next start of Factorio. (Restarting the
+		// bridge in place hung DXGI on an RTX 3080, both ways; Streamline cannot start twice in a session anyway.)
 		const resource bb = native_back_buffer(sc);
 		if (bb.handle == 0)
 			return;
@@ -819,6 +856,8 @@ namespace
 		{
 			if (g_bridge_failed)
 				return;
+			fg::request(static_cast<fg::choice>(g_fg_choice));
+			g_fg_choice_applied = g_fg_choice;
 			auto *const dev11 = reinterpret_cast<ID3D11Device *>(g_device->get_native());
 			const bool ok = bridge::init(dev11, static_cast<HWND>(sc->get_hwnd()), g_bb_desc.texture.width, g_bb_desc.texture.height,
 				static_cast<DXGI_FORMAT>(g_bb_desc.texture.format), bridge_log);
@@ -837,6 +876,11 @@ namespace
 		options.motion_hysteresis = g_motion_hysteresis;
 		options.motion_strictness = g_motion_strictness;
 		options.motion_debug_view = g_motion_debug;
+		options.fg_debug_view = g_fsr_debug;
+		options.fg_show_ui_layer = g_fsr_ui_layer;
+		options.fg_only_generated = g_fsr_only_generated;
+		options.fg_hold_character = g_fsr_hold;
+		options.fg_inpaint_character = g_fsr_inpaint;
 		options.motion_far_penalty = g_motion_far_penalty;
 		// Map view (and anything else without the game view's post pass): nothing follows the camera, so nothing is
 		// still. The boundary rule's anchor only matches in the game view.
@@ -1818,7 +1862,7 @@ namespace
 			ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
 		if (ImGui::Begin("##fg_osd", nullptr, flags))
 		{
-			ImGui::Text("FG %ux%s | Factorio %.0f fps -> %.0f fps | v" ADDON_VERSION_STRING, shown, g_fg_multiplier == 0 ? " auto" : "",
+			ImGui::Text("%s %ux%s | Factorio %.0f fps -> %.0f fps | v" ADDON_VERSION_SHOWN, bridge::backend_name(), shown, g_fg_multiplier == 0 ? " auto" : "",
 				g_base_fps, g_base_fps * (shown != 0 ? shown : 1));
 			ImGui::Text("Camera %+5.1f %+5.1f px | zoom %.3f | match %3.0f%% | MV %s", dx, dy, bridge::motion_zoom(), conf * 100.0f, g_motion_vectors ? "on" : "off");
 			if (has_notice)
@@ -1827,8 +1871,15 @@ namespace
 				float cam = 0, still = 0, own = 0;
 				bridge::motion_shares(cam, still, own);
 				ImGui::Text("Blocks: camera %3.0f%% | still %3.0f%% | own %3.0f%%%s%s", cam * 100.0f, still * 100.0f, own * 100.0f,
-					g_still_zone_active ? "" : " | map: no still", g_motion_debug ? " | DEBUG VIEW" : "");
+					g_still_zone_active ? "" : " | map: no still", g_motion_debug ? " | DEBUG VIEW (frame generation paused)" : "");
 			}
+			// where this frame's HUD-less copy came from: without the rule, the GUI is in it and moves with the world
+			if (g_last_matched_at >= 0)
+				ImGui::Text("GUI capture: rule matched (draw %d)", g_last_matched_at);
+			else
+				ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "GUI capture: %s - the GUI is not kept out of frame generation",
+					g_mode == boundary_mode::off ? "OFF (HUD-less capture tab: Use Factorio default rule)" : (g_last_auto_at >= 0 ? "fallback" : "none"));
+			ImGui::Text("%s", bridge::fg_status()); // UI layer, character held / painted over, diagnostics
 			if (const char *warning = capture_warning())
 				ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "%s", warning);
 			if (setup::problems() > 0)
@@ -1952,12 +2003,38 @@ namespace
 			bool changed = ImGui::Checkbox("Frame generation on (presents the game through D3D12)", &g_bridge_enabled);
 			if (changed)
 				g_bridge_failed = false;
+			// Technology
+			{
+				ImGui::TextUnformatted("Technology:");
+				ImGui::SameLine();
+				int choice = g_fg_choice;
+				ImGui::RadioButton("Automatic##tech", &choice, 0); ImGui::SameLine();
+				ImGui::RadioButton("NVIDIA DLSS-G##tech", &choice, 1); ImGui::SameLine();
+				ImGui::RadioButton("AMD FSR##tech", &choice, 2);
+				if (choice != g_fg_choice)
+				{
+					g_fg_choice = choice;
+					g_bridge_failed = false; // try again with the new choice
+					changed = true;
+				}
+				const char *running = bridge::active() ? bridge::backend_name() : "none (frame generation off)";
+				ImGui::TextDisabled("  In use: %s. Automatic: DLSS-G on NVIDIA RTX when installed, else FSR (any DirectX 12 GPU, 2x).", running);
+				if (bridge::active() && g_fg_choice_applied >= 0 && g_fg_choice != g_fg_choice_applied)
+					ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "  Restart Factorio to switch: the technology is chosen when frame generation starts.");
+			}
+			// What the running technology supports (nothing greyed out while frame generation is not running)
+			const bool fsr_running = bridge::active() && std::strcmp(bridge::backend_name(), "FSR") == 0;
+			const int max_mult = bridge::active() ? static_cast<int>(bridge::max_multiplier()) : 4;
 			ImGui::TextUnformatted("Multiplier:");
 			ImGui::SameLine();
 			changed |= ImGui::RadioButton("Off##fg", &g_fg_multiplier, 1); ImGui::SameLine();
 			changed |= ImGui::RadioButton("2x", &g_fg_multiplier, 2); ImGui::SameLine();
+			ImGui::BeginDisabled(max_mult < 3);
 			changed |= ImGui::RadioButton("3x", &g_fg_multiplier, 3); ImGui::SameLine();
+			ImGui::EndDisabled();
+			ImGui::BeginDisabled(max_mult < 4);
 			changed |= ImGui::RadioButton("4x", &g_fg_multiplier, 4); ImGui::SameLine();
+			ImGui::EndDisabled();
 			changed |= ImGui::RadioButton("Auto", &g_fg_multiplier, 0);
 			ImGui::SameLine();
 			ImGui::TextDisabled("(Off = bridge only)");
@@ -1976,7 +2053,17 @@ namespace
 				ImGui::Text("Factorio %.1f fps", g_base_fps);
 
 			ImGui::Separator();
-			ImGui::TextWrapped("DLSS-G: %s", bridge::fg_status());
+			ImGui::TextWrapped("%s: %s", bridge::backend_name(), bridge::fg_status());
+			if (bridge::max_multiplier() < 4 && bridge::active())
+				ImGui::TextDisabled("  %s generates one frame per Factorio frame: 2x at most.", bridge::backend_name());
+			changed |= ImGui::Checkbox("Keep the character sharp", &g_fsr_hold);
+			ImGui::TextDisabled("  While you move, generated frames show the character from the newest Factorio frame (laid over them like the GUI) instead of a blend of two animation poses.");
+			ImGui::BeginDisabled(!g_fsr_hold);
+			changed |= ImGui::Checkbox("  ...and remove it from what frame generation blends", &g_fsr_inpaint);
+			ImGui::EndDisabled();
+			ImGui::TextDisabled("    Frame generation gets what is under the character (from the world snapshots) instead of the character, moving with the world: no copies of it, and much less noise where the ground behind it is uncovered.");
+			if (!fsr_running && bridge::active())
+				ImGui::TextDisabled("    DLSS-G: uses its UI recomposition; if this DLSS-G does not offer it, the DLSS-G line above shows no \"UI layer\" and these have no effect.");
 			ImGui::TextWrapped("Bridge: %s%s", bridge::status(), g_bridge_failed ? " (init failed, see ReShade.log)" : "");
 			if (bridge::active())
 			{
@@ -2150,9 +2237,9 @@ namespace
 			ImGui::TextDisabled("(%.2f / %.2f / %.2f / %.2f / %.3f / %.2f)", DEFAULT_MOTION_PENALTY_ZERO, DEFAULT_MOTION_MISMATCH, DEFAULT_MOTION_HYSTERESIS,
 				DEFAULT_MOTION_STRICTNESS, DEFAULT_MOTION_FAR_PENALTY, DEFAULT_MOTION_STILL_ZONE);
 			}
-			if (ImGui::CollapsingHeader(g_motion_debug ? "Debug views (ON)###dbg" : "Debug views###dbg", 0))
+			if (ImGui::CollapsingHeader(g_motion_debug || g_fsr_debug || g_fsr_ui_layer || g_fsr_only_generated ? "Debug views (ON)###dbg" : "Debug views###dbg", 0))
 			{
-			ImGui::Checkbox("Debug view (replaces the game picture)", &g_motion_debug);
+			ImGui::Checkbox("Debug view (replaces the game picture; frame generation pauses so you see exactly this frame)", &g_motion_debug);
 			ImGui::RadioButton("Motion kinds", &g_debug_mode, 0);
 			ImGui::SameLine();
 			ImGui::RadioButton("World layers / depth", &g_debug_mode, 1);
@@ -2173,6 +2260,19 @@ namespace
 				float cam = 0, still = 0, own = 0;
 				bridge::motion_shares(cam, still, own);
 				ImGui::Text("Blocks: camera %.0f%% | still %.0f%% | own motion %.0f%%", cam * 100.0f, still * 100.0f, own * 100.0f);
+			}
+			{
+				const bool fsr_on = bridge::active() && std::strcmp(bridge::backend_name(), "FSR") == 0;
+				ImGui::BeginDisabled(!fsr_on);
+				ImGui::Checkbox("FSR debug view (AMD's own)", &g_fsr_debug);
+				ImGui::TextDisabled("  Shows only the generated frames, with FSR's internal pictures (motion, disocclusion, ...) drawn over them. Not saved.");
+				ImGui::EndDisabled();
+				ImGui::Checkbox("Show the GUI layer", &g_fsr_ui_layer);
+				ImGui::TextDisabled("  The world turns black; only what the add-on took for GUI (and the held character) stays. That layer is laid over every shown frame, so it should stay sharp when panning. Not saved.");
+				ImGui::BeginDisabled(!fsr_on);
+				ImGui::Checkbox("Show generated frames only (FSR)", &g_fsr_only_generated);
+				ImGui::TextDisabled("  Only FSR's in-between frames reach the screen (60 fps, choppy): a screenshot then shows a generated frame. Not saved.");
+				ImGui::EndDisabled();
 			}
 			}
 			if (changed)
@@ -2526,7 +2626,7 @@ namespace
 #endif
 
 extern "C" __declspec(dllexport) const char *NAME = ADDON_DISPLAY_NAME;
-extern "C" __declspec(dllexport) const char *DESCRIPTION = "DLSS frame generation for Factorio: HUD-less capture, D3D12 bridge, Streamline DLSS-G, image-based motion vectors. Version " ADDON_VERSION_STRING " (" ADDON_VERSION_STAGE ").";
+extern "C" __declspec(dllexport) const char *DESCRIPTION = "Frame generation for Factorio: HUD-less capture, D3D12 bridge, NVIDIA DLSS-G (Streamline) or AMD FSR, image-based motion vectors. Version " ADDON_VERSION_STRING " (" ADDON_VERSION_STAGE ").";
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {

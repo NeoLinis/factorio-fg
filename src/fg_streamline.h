@@ -10,7 +10,7 @@
 #include <dxgi1_4.h>
 #include <cstdint>
 
-namespace fg
+namespace fg_sl
 {
 	using log_fn = void (*)(const char *message);
 
@@ -33,8 +33,11 @@ namespace fg
 	void frame_start();                                   // first draw of a Factorio frame
 	// 'motion_vectors': pixels, current -> previous frame, in D3D12_RESOURCE_STATE_UNORDERED_ACCESS; null = zero motion.
 	// 'depth_layers': R32_FLOAT in D3D12_RESOURCE_STATE_UNORDERED_ACCESS; null = flat depth.
+	// 'ui' (with its state): the UI layer (ui_layer.h), recomposed by DLSS-G over generated frames; 'clean' (null: the
+	// HUD-less frame) is the frame DLSS-G interpolates then, the character painted over.
 	void before_present(ID3D12GraphicsCommandList *list,  // open list that copies the frame into the back buffer
-		ID3D12Resource *hudless, ID3D12Resource *motion_vectors, ID3D12Resource *depth_layers, uint32_t width, uint32_t height, int multiplier);
+		ID3D12Resource *hudless, ID3D12Resource *ui, D3D12_RESOURCE_STATES ui_state, ID3D12Resource *clean, D3D12_RESOURCE_STATES clean_state,
+		ID3D12Resource *motion_vectors, ID3D12Resource *depth_layers, uint32_t width, uint32_t height, int multiplier);
 	void present_start();
 	void present_end();
 	void reset_history();                                 // after a resize or anything that breaks frame continuity
@@ -49,4 +52,8 @@ namespace fg
 	// Frames shown per Factorio frame at the last state poll (1 = no generated frames), 0 if unknown.
 	uint32_t frames_per_present();
 	const char *depth_status(); // which depth was tagged and whether Streamline accepted it
+	// Largest multiplier the system reports (4 until known).
+	uint32_t max_multiplier();
+	// False once slShutdown ran: Streamline cannot be initialised again in the same process.
+	bool restartable();
 }

@@ -32,12 +32,13 @@ namespace sl { namespace security { inline bool verifyEmbeddedSignature(const wc
 
 namespace
 {
-	fg::log_fn g_log = nullptr;
+	fg_sl::log_fn g_log = nullptr;
 	bool g_load_attempted = false;
 	HMODULE g_interposer = nullptr;
 	std::wstring g_sl_dir;
 
 	bool g_initialized = false; // slInit succeeded and slShutdown not called yet
+	bool g_shut_down = false;   // slShutdown was called: Streamline cannot be started again in this process
 	bool g_attached = false;    // device set and DLSS-G usable
 
 	PFun_slInit *p_slInit = nullptr;
@@ -67,6 +68,8 @@ namespace
 	bool g_reset = true;
 
 	int g_applied_multiplier = -1;
+	bool g_applied_ui = false;
+	bool g_ui_unsupported = false; // DLSS-G refused UI recomposition once: no UI layer from then on
 	uint32_t g_frames_max = 0;      // DLSSGState::numFramesToGenerateMax
 	uint32_t g_frames_presented = 0;
 	uint32_t g_dlssg_status = 0;
@@ -232,7 +235,7 @@ namespace
 	}
 }
 
-namespace fg
+namespace fg_sl
 {
 	bool load(log_fn log)
 	{
@@ -285,7 +288,7 @@ namespace fg
 
 	bool begin()
 	{
-		if (g_interposer == nullptr)
+		if (g_interposer == nullptr || g_shut_down)
 			return false;
 		if (g_initialized)
 			return true;
@@ -423,7 +426,8 @@ namespace fg
 		g_render_started = true;
 	}
 
-	void before_present(ID3D12GraphicsCommandList *list, ID3D12Resource *hudless, ID3D12Resource *motion_vectors, ID3D12Resource *depth_layers,
+	void before_present(ID3D12GraphicsCommandList *list, ID3D12Resource *hudless, ID3D12Resource *ui, D3D12_RESOURCE_STATES ui_state,
+		ID3D12Resource *clean, D3D12_RESOURCE_STATES clean_state, ID3D12Resource *motion_vectors, ID3D12Resource *depth_layers,
 		uint32_t width, uint32_t height, int multiplier)
 	{
 		if (!g_attached)
@@ -484,15 +488,23 @@ namespace fg
 		sl::Resource mvec = motion_vectors != nullptr
 			? sl::Resource(sl::ResourceType::eTex2d, motion_vectors, static_cast<uint32_t>(D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
 			: sl::Resource(sl::ResourceType::eTex2d, g_mvec, static_cast<uint32_t>(D3D12_RESOURCE_STATE_COMMON));
-		sl::Resource hud(sl::ResourceType::eTex2d, hudless, static_cast<uint32_t>(D3D12_RESOURCE_STATE_COMMON));
+		// HUD-less: the clean frame (character painted over) when there is one; with the UI layer (GUI and held
+		// character from the real frame), DLSS-G interpolates the HUD-less frame and recomposes the UI on top.
+		const bool with_ui = ui != nullptr && hudless != nullptr && !g_ui_unsupported;
+		if (!with_ui)
+			clean = nullptr; // without the recomposed UI layer the character must stay in the HUD-less frame
+		sl::Resource hud = clean != nullptr ? sl::Resource(sl::ResourceType::eTex2d, clean, static_cast<uint32_t>(clean_state))
+			: sl::Resource(sl::ResourceType::eTex2d, hudless, static_cast<uint32_t>(D3D12_RESOURCE_STATE_COMMON));
+		sl::Resource ui_res(sl::ResourceType::eTex2d, ui, static_cast<uint32_t>(ui_state));
 		const sl::ResourceTag tags[] = {
 			sl::ResourceTag(&depth, sl::kBufferTypeDepth,
 				depth_layers != nullptr ? sl::ResourceLifecycle::eOnlyValidNow : sl::ResourceLifecycle::eValidUntilPresent, &extent),
 			sl::ResourceTag(&mvec, sl::kBufferTypeMotionVectors,
 				motion_vectors != nullptr ? sl::ResourceLifecycle::eOnlyValidNow : sl::ResourceLifecycle::eValidUntilPresent, &extent),
 			sl::ResourceTag(&hud, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eOnlyValidNow, &extent),
+			sl::ResourceTag(&ui_res, sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eOnlyValidNow, &extent),
 		};
-		const sl::Result tag_result = p_slSetTagForFrame(*g_token, viewport, tags, hudless != nullptr ? 3u : 2u, list);
+		const sl::Result tag_result = p_slSetTagForFrame(*g_token, viewport, tags, with_ui ? 4u : (hudless != nullptr ? 3u : 2u), list);
 		if (tag_result != sl::Result::eOk)
 			log_line("fg: slSetTagForFrame failed (%d)", static_cast<int>(tag_result));
 		if (depth_layers != nullptr && tag_result == sl::Result::eOk)
@@ -518,9 +530,11 @@ namespace fg
 		multiplier = std::clamp(multiplier, 1, 6);
 		// Limit to what this system supports; until the limit is known, stay at 2x.
 		multiplier = std::min<int>(multiplier, g_frames_max != 0 ? static_cast<int>(g_frames_max) + 1 : 2);
-		if (multiplier != g_applied_multiplier)
+		if (multiplier != g_applied_multiplier || with_ui != g_applied_ui)
 		{
 			sl::DLSSGOptions options{};
+			// interpolate the HUD-less frame and lay the UI layer over the generated frames
+			options.enableUserInterfaceRecomposition = with_ui ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 			options.mode = multiplier > 1 ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
 			options.numFramesToGenerate = static_cast<uint32_t>(std::max(1, multiplier - 1));
 			options.numBackBuffers = 3;
@@ -531,15 +545,24 @@ namespace fg
 			if (p_slDLSSGSetOptions(viewport, options) == sl::Result::eOk)
 			{
 				g_applied_multiplier = multiplier;
-				log_line("fg: DLSS-G %s", multiplier > 1 ? (std::to_string(multiplier) + "x").c_str() : "off");
+				g_applied_ui = with_ui;
+				log_line("fg: DLSS-G %s%s", multiplier > 1 ? (std::to_string(multiplier) + "x").c_str() : "off",
+					with_ui ? ", UI layer recomposed" : "");
+			}
+			else if (with_ui)
+			{
+				// this DLSS-G may not offer UI recomposition: go on without the UI layer (applied next frame)
+				g_ui_unsupported = true;
+				log_line("fg: slDLSSGSetOptions with UI recomposition failed; continuing without the UI layer");
 			}
 			else
 				log_line("fg: slDLSSGSetOptions failed");
 		}
 
-		set_status("DLSS-G %s | status %s | max %ux | last present showed %u frame(s)",
+		set_status("DLSS-G %s | status %s | max %ux | last present showed %u frame(s)%s",
 			g_applied_multiplier > 1 ? (std::to_string(g_applied_multiplier) + "x").c_str() : "off",
-			status_text(g_dlssg_status), g_frames_max + 1, g_frames_presented);
+			status_text(g_dlssg_status), g_frames_max + 1, g_frames_presented,
+			g_applied_ui ? (clean != nullptr ? " | UI layer, character painted over" : " | UI layer") : "");
 	}
 
 	void present_start()
@@ -595,6 +618,7 @@ namespace fg
 		if (result != sl::Result::eOk)
 			log_line("fg: slShutdown returned %d", static_cast<int>(result));
 		g_initialized = false;
+		g_shut_down = true;
 		p_slDLSSGSetOptions = nullptr;
 		p_slDLSSGGetState = nullptr;
 		p_slReflexSetOptions = nullptr;
@@ -615,5 +639,15 @@ namespace fg
 	uint32_t frames_per_present()
 	{
 		return g_attached ? g_frames_presented : 0;
+	}
+
+	uint32_t max_multiplier()
+	{
+		return g_attached && g_frames_max > 0 ? g_frames_max + 1 : 4;
+	}
+
+	bool restartable()
+	{
+		return !g_shut_down;
 	}
 }

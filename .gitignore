@@ -4,3 +4,4 @@ dist/
 *.addon64
 *.addon32
 factorio_fg_shaders.cache
+third_party/fidelityfx/bin/

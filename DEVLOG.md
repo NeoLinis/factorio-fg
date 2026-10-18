@@ -597,3 +597,79 @@ copies each way). The bridge now hands out its shared textures and the snapshots
 sets alternate frame by frame, so D3D11 never writes the set D3D12 may still be reading; the existing fence wait at
 present orders the rest. When the textures are recreated (resize, frame generation restarted) a frame's snapshots
 are dropped rather than used. With the developer preview showing a snapshot, the old two-copy path is used.
+
+## FSR: the GUI kept out of frame generation
+
+First test on the RTX 3080: FSR 3.1 ran, module blur on pans looked better than with DLSS-G in places, but the GUI
+ghosted on movement and the character showed artifacts. FSR was given the final frame plus `HUDLessColor`, from
+which it detects the UI itself; that detection let the moving world show through the GUI in generated frames.
+
+FSR's swap chain can instead compose a separate UI surface over every presented frame. The add-on has both
+pictures, so a small compute pass writes the UI surface (the final frame where it differs from the HUD-less copy,
+alpha 1; elsewhere transparent), the back buffer gets the HUD-less frame, and the surface is registered with the
+swap chain each frame, with its internal double buffering so the texture can be rewritten right after Present.
+Real frames come out identical to Factorio's; generated frames show the interpolated world with the newest GUI on
+top. With frame generation off the surface is unregistered and the final frame is presented as before. FSR's own
+detection stays as the fallback (no HUD-less frame, motion debug view shown, shader not available). AMD's debug view
+(`FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW`) is available under Debug views for the character artifacts.
+
+The real cause: the GUI capture rule was **Off**. `load_config` started from `int mode = 0` (Off) and kept it when
+the `Mode` key was missing, i.e. on every fresh install; the next settings change saved that Off. Since 1.0.0 a
+clean install therefore never captured a HUD-less frame: the "HUD-less" copy was the final frame with the GUI,
+DLSS-G coped (its optical flow sees the GUI standing still), FSR moved the GUI with the world, and the still zone
+for the character (which needs the rule) was off. The default is now the built-in rule, and a saved Off is
+switched once (`CaptureModeChecked`). The readout has a *GUI capture* line so this cannot go unnoticed again.
+
+Switching the technology in place (bridge shutdown and restart) hung DXGI in both directions on the RTX 3080; the
+choice now applies at the next start of Factorio.
+
+## Character held still per pixel
+
+FSR's debug view showed the running character with the camera's motion in our vectors (FSR's own optical flow saw
+it differently but trusted ours), and the readout showed 0 % still blocks. The world layers had the character as an
+object, so the block search was what missed it: a 16 x 16 block on the character is mostly ground moving with the
+camera, and the running animation never matches "no motion" well enough for the block to turn still. DLSS-G hid
+this with its own optical flow. Now `cs_expand` checks object pixels in the still zone (when the camera moves): if
+"no motion" matches the 3 x 3 neighbourhood clearly better (x0.7) than both the camera and the block's motion, the
+pixel is still. Buildings passing the centre match the camera and are unaffected.
+
+## The character as part of the UI layer (FSR)
+
+With the character held still (beta 7) the remaining blur on it is the blend itself: Factorio animates at the
+game's tick rate, so a generated frame between two ticks can only mix two poses (FSR blends them softer than
+DLSS-G). The character stays at the same place on screen while the camera follows it, so it does not need to be
+interpolated at all: `cs_expand` writes a `hold` mask (object pixels in the still zone that ended up still while
+the camera moves), and FSR's UI extraction adds those pixels (grown by one for the outline) to the UI layer. The
+swap chain then lays the newest real frame's character over each generated frame, exactly as it does the GUI.
+Setting: *Keep the character sharp (FSR)*, on by default. The shadow is left out: the ground under it moves, so
+taking it from the real frame would show a seam.
+
+## The character removed from what FSR blends (experimental toggle)
+
+Holding the character and laying it over each generated frame left an "after image in front": FSR still blends a
+picture with the character in it, and around a static object on scrolling ground it pulls character pixels into
+the ground half a camera step away. Tools that add frame generation to existing games treat the character, its
+shadow and the moving background separately and fall back to real-frame pixels at uncovered background. Here the
+background under the character is known: the floor snapshot (world after the floor stage: ground, belts,
+shadows, no objects). With *...and remove it from what FSR blends*, the UI pass also writes a clean frame: the
+HUD-less frame, with the held character (grown by 2 px) replaced by the floor snapshot times the lighting ratio
+(finished frame / snapshot, summed over 8 points 48 px around that are not held, per channel). That clean frame
+goes into the back buffer, so FSR interpolates ground only; the sharp character from the real frame still goes
+on top through the UI layer. Off by default to compare.
+
+## The UI layer for both technologies
+
+The GUI and held-character layer and the clean frame were FSR-only code. They now live in `ui_layer` (one compute
+pass, recorded by the bridge before the backend), and each backend uses them its own way: FSR copies the clean (or
+HUD-less) frame into the back buffer and registers the layer with its swap chain; DLSS-G gets the layer as UI color
+and alpha with `enableUserInterfaceRecomposition` on, and the clean frame as its HUD-less input. If this DLSS-G
+refuses the option, it continues without the layer (and without the clean frame, which would otherwise make the
+character look like UI). The character still-hold in the motion vectors was already shared.
+
+## 1.1.0 wrap-up
+
+Betas 25-26: a pass closing the hold over pixels near the character (the vote missed its trailing edge) gave a halo
+in front while flying and no gain behind, and was removed; a held shadow is no longer painted over (the floor
+snapshot contains it, and moved with the ground it was dragged behind the player). With the paint-over on or off
+the noise behind a moving character looked the same: it is frame generation guessing uncovered ground, which the
+add-on cannot know better from outside the game. Paint-over stays as an option, off by default. Released as 1.1.0.

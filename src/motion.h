@@ -42,6 +42,9 @@ namespace motion
 		                               // 6 air split snapshot
 		bool icons_first = true;    // alt-mode icons are drawn before the air split (flying robots after it)
 		bool wide_search = true;    // look up to +-192 px for fast movers where the normal mover search finds nothing
+		bool spread_depth = false;  // depth for FSR: same layer order, values spread far apart in distance
+		bool hold_as_ground = false; // the held character is painted over in the frame generation input: give its pixels
+		                             // the camera's motion and the ground's depth (what is there now is the world)
 	};
 
 	// Starts compiling the shaders on a worker thread (or loads them from the cache). Optional; init() does it too.
@@ -94,6 +97,8 @@ namespace motion
 	// Depth from the world layers (R32_FLOAT, UNORDERED_ACCESS state, 0.25 placed on the ground / 0.75 bare ground;
 	// flat 0.75 without layers), or nullptr.
 	ID3D12Resource *depth_texture();
+	// R8_UNORM, full res, UAV state: 1 where the character is held still while the camera moves (FSR keeps it sharp)
+	ID3D12Resource *hold_texture();
 	// Motion debug picture of the frame just recorded (UNORDERED_ACCESS state, colour format), or nullptr.
 	ID3D12Resource *debug_texture();
 	// Share of blocks (0..1) moving with the camera / still / with their own motion, a few frames old.

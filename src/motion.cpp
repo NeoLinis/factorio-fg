@@ -67,6 +67,11 @@ RWTexture2D<float> detail_half_prev : register(u17);
 // Depth for DLSS-G from the world layers: near = something placed on the ground (from the entity snapshot), far =
 // bare ground. Without layers (map view, space) it is flat (far).
 RWTexture2D<float> depth_out : register(u18);
+// Character pixels held still while the camera moves: 1 on the ground (object, shadow), 0.5 flying (the character in
+// mech armour), else 0. FSR shows them from the newest real frame instead of blending two animation poses.
+RWTexture2D<unorm float> hold_out : register(u22);
+// Half res: running average of "stays put on screen" evidence (-1..1), updated while the camera moves.
+RWTexture2D<float> still_score : register(u23);
 // World layers (step 8): Factorio's world picture after the tiles (ground), after the floor stage (belts, pipes,
 // inserters, floor entities, all shadows) and right before the cloud pass (all objects in, no clouds, no alt-mode
 // icons). Plus the air stage: the world right after the cloud pass and right before the composite pass; what differs
@@ -265,7 +270,8 @@ float2 spread_point(uint s, float2 size)
 // the rest rescaled. Too few valid samples: worst possible.
 uint encode_sad(float sum, float count)
 {
-	return count >= 384.0 ? uint(sum * 768.0 / count * 1024.0) : 0xffffffff;
+)hlsl"
+		R"hlsl(	return count >= 384.0 ? uint(sum * 768.0 / count * 1024.0) : 0xffffffff;
 }
 
 // Groups: x = candidate (33 x 33), y = grid (0: around zero, 1: around the prediction). 64 threads x 12 samples.
@@ -275,8 +281,7 @@ void cs_global_coarse(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 	int2 c = gid.y == 0 ? int2(0, 0) : predicted_center();
 	int2 d = c + int2(gid.x % CN, gid.x / CN) - CR;
 	int2 lo, span;
-)hlsl"
-		R"hlsl(	search_region(int2(eighth_size), c, CR, lo, span);
+	search_region(int2(eighth_size), c, CR, lo, span);
 	float sum = 0;
 	for (uint k = 0; k < 12; ++k)
 	{
@@ -586,7 +591,8 @@ float window_sad_q(int2 qbase, int2 d)
 // objects or flying things where the camera does not match and the normal search found nothing.
 // Same uniqueness test (identical wagons one wagon apart are rejected, as before).
 #define WR 24
-#define WN (WR + 1)          // grid points per axis (step 2)
+)hlsl"
+		R"hlsl(#define WN (WR + 1)          // grid points per axis (step 2)
 float window_sad_e(int2 ebase, int2 d)
 {
 	float s = 0;
@@ -601,8 +607,7 @@ float window_sad_e(int2 ebase, int2 d)
 	return s;
 }
 
-)hlsl"
-		R"hlsl(// The block search runs in three passes (since 0.13): cs_block_pre decides per block what is needed (most blocks are
+// The block search runs in three passes (since 0.13): cs_block_pre decides per block what is needed (most blocks are
 // done there: bare ground, new ground at the edges, alt-mode icons), cs_mover runs the mover searches with 64 threads
 // per block (was one thread per block: a few searching blocks held up whole warps), cs_block finishes the rest.
 // block_pre (float4 per block): x camera SAD, y state, zw search centre (half-res px). State: 0 done (block_mv written),
@@ -911,12 +916,12 @@ void cs_block(uint3 id : SV_DispatchThreadID)
 	// The camera is the default answer: always allowed, no penalty except for changing kind.
 	int2 best = gi;
 	const float camera_sad = pre.x;
-	float best_sad = camera_sad;
+)hlsl"
+		R"hlsl(	float best_sad = camera_sad;
 	float best_cost = best_sad + (last_kind != 0 ? hysteresis : 0.0);
 	// Own motion that this block did not have last frame must be clearly better than the camera: animated sprites
 	// (water, trees, smoke, machines) change shape without moving, and a shifted patch sometimes matches an animation
-)hlsl"
-		R"hlsl(	// frame a little better. Real movers (trains, cars, bots) match far better, or keep last frame's motion.
+	// frame a little better. Real movers (trains, cars, bots) match far better, or keep last frame's motion.
 	const float unconfirmed_limit = camera_sad * (1.0 - strictness);
 
 	// A unique, clearly better match found by the mover search: no distance penalty (that guard was for repeating
@@ -1056,6 +1061,21 @@ void cs_smooth(uint3 id : SV_DispatchThreadID)
 	InterlockedAdd(stats[kind_of(m)], 1, dummy);
 }
 
+// Mean brightness difference over 5 x 5 half-res pixels, current at p against previous at p + d.
+float luma_sad5(int2 p, int2 d)
+{
+	float s = 0;
+	int2 hmax = int2(half_size) - 1;
+	[unroll] for (int y = -2; y <= 2; ++y)
+	[unroll] for (int x = -2; x <= 2; ++x)
+	{
+		int2 a = clamp(p + int2(x, y), int2(0, 0), hmax);
+		int2 q = clamp(a + d, int2(0, 0), hmax);
+		s += abs(luma_half[a] - luma_half_prev[q]);
+	}
+	return s / 25.0;
+}
+
 float pixel_sad(int2 p, int2 d)
 {
 	float s = 0;
@@ -1132,16 +1152,91 @@ void cs_expand(uint3 id : SV_DispatchThreadID)
 		}
 	}
 
+	// The character (or the vehicle being driven) near the centre: the camera follows it, so it stays put on screen.
+	// Per pixel, as the block search misses it (a running animation never matches well, and its blocks are mostly
+	// ground moving with the camera). Object, floor (shadow) and flying pixels in the still zone while the camera
+	// moves: if the camera does not explain the pixel (brightness over 5 x 5 half-res pixels: on the character the
+	// camera's shift lands on ground) it follows the camera, i.e. it is still. Brightness, not detail: the armour's
+	// flat areas have no detail but clearly differ from the ground. A real mover crossing the centre (a big own motion
+	// from the block search) keeps it unless "no motion" matches clearly better. Buildings and belts passing the
+	// centre match the camera: unaffected. Held (FSR shows them from the real frame): the still object pixels.
+	const float mask_here = layers_valid() ? entity_mask[p] : 0.0;
+	bool hold = false;
+	// Flying counts too: the character flying in mech armour is drawn with the flying things (bots, the air layer).
+	// Bare ground too: the shadow of the flying character is not in the floor snapshot, so it sits on "ground" pixels
+	// (bare ground itself always votes for the camera).
+	// Alt-mode icon pixels too: the air split puts whatever is drawn early in the air stage there, and the flying
+	// character is (it was never held in flight, and got the camera motion icons get). Real icons vote for the camera.
+	[branch] if (in_still_zone(float2(p)) &&
+		any(abs(cam) >= 1.0))
+	{
+		float l_zero = luma_sad5(p, int2(0, 0));
+		const float l_cam = luma_sad5(p, int2(round(cam)));
+		// "Stays put" allows a small vertical move: the character hovering in mech armour bobs up and down, and
+)hlsl"
+		R"hlsl(		// rises / sinks while taking off and landing (it was missed then, only its shadow held). Not on bare
+		// ground, where a vertical shift has no meaning for the shadow and would only cost time.
+		[branch] if (mask_here > 0.0)
+		{
+			[unroll] for (int k = 1; k <= 4; ++k)
+			{
+				const int dy = (k & 1) != 0 ? (k + 1) : -k; // +2, -2, +4, -4 half-res px
+				l_zero = min(l_zero, luma_sad5(p, int2(0, dy)));
+			}
+		}
+		const bool big_own = !use_camera && length(mv) >= 2.0 + 0.25 * length(cam);
+		bool still = false;
+		[branch] if (big_own)
+		{
+			const float l_given = luma_sad5(p, int2(round(mv)));
+			still = l_zero < 0.7 * l_given && l_zero < 0.7 * l_cam;
+		}
+		else
+		{
+			// Evidence that this pixel stays put on screen while the world moves under it, averaged over frames: the
+			// running / flying animation makes single frames unreliable (parts dropped out: FSR moved them with the
+			// ground, copies), but on average the character matches "no motion" better than the camera, and
+			// everything else (decoratives, animated machines, trees) the camera better.
+			// A vote per frame ("no motion" better than the camera at all: +1, else -1), not the size of the
+			// difference: on the running character both matches are poor and the difference small, while its shadow
+			// differs strongly; the vote treats them alike. Held while most recent frames voted "stays put".
+			const float e = l_cam > l_zero + 0.005 ? 1.0 : -1.0;
+			const float score = lerp(still_score[p], e, 0.35);
+			still_score[p] = score;
+			still = score > 0.2;
+		}
+		if (still)
+		{
+			use_camera = false;
+			mv = float2(0, 0);
+			hold = true; // the character and its shadow (the ground inside the shadow comes along: dark, little to see)
+		}
+	}
+
 	// Bare ground pixel: the camera, whatever the block decided (exact edges around the player, revealed ground).
-	if (layers_valid() && entity_mask[p] == 0)
+	if (layers_valid() && entity_mask[p] == 0 && !hold)
+		use_camera = true;
+	// Character painted over (flag 32768): frame generation gets what is under it there - the world, moving with the
+	// camera - and the character comes from the UI layer. So the camera's motion and the ground's depth: the world
+	// behind the character is interpolated like the rest of it (no noise where it is uncovered).
+	// Only objects and flying things: a held shadow (floor, or bare ground in flight) stays in the frame as it is, still -
+	// the floor snapshot it would be painted from contains that very shadow, which would then move with the ground.
+	const bool as_ground = hold && (flags & 32768) != 0 && layers_valid() && mask_here >= LAYER_OBJECT - 0.01;
+	if (as_ground)
 		use_camera = true;
 
 	float4 mdl = global_motion[4];
 	float2 t_full = global_motion[0].xy * 2.0;
 	// ground far, floor (belts, shadows), objects, alt-mode icons, flying (bots) nearest
 	const float layer = layers_valid() ? entity_mask[p] : 0.0;
-	const float depth = layer >= LAYER_AIR ? 0.1 : (is_icon(layer) ? 0.15 : (layer >= LAYER_OBJECT ? DEPTH_NEAR :
+	float depth = layer >= LAYER_AIR ? 0.1 : (is_icon(layer) ? 0.15 : (layer >= LAYER_OBJECT ? DEPTH_NEAR :
 		(layer > 0.0 ? 0.5 * (DEPTH_NEAR + DEPTH_FAR) : DEPTH_FAR)));
+	// FSR: the same order, spread far apart once FSR turns depth into distances (near 0.1, far 100: ground ~50,
+	// floor ~1, objects ~0.2, flying ~0.13), so it never pulls the character into the ground around it.
+	if (flags & 16384)
+		depth = layer >= LAYER_AIR ? 0.2 : (is_icon(layer) ? 0.4 : (layer >= LAYER_OBJECT ? 0.5 : (layer > 0.0 ? 0.9 : 0.999)));
+	if (as_ground)
+		depth = (flags & 16384) ? 0.999 : DEPTH_FAR;
 	uint2 f = id.xy * 2;
 	[unroll] for (uint y = 0; y < 2; ++y)
 	[unroll] for (uint x = 0; x < 2; ++x)
@@ -1151,7 +1246,7 @@ void cs_expand(uint3 id : SV_DispatchThreadID)
 		float2 v = use_camera ? (mdl.x - 1.0) * (float2(q) - mdl.yz) + t_full : mv * 2.0;
 		if (flags & 1) v = -v;
 		if ((flags & 2) == 0) v = float2(0, 0);
-		if (all(q < full_size)) { mvec[q] = v; depth_out[q] = depth; }
+		if (all(q < full_size)) { mvec[q] = v; depth_out[q] = depth; hold_out[q] = hold ? (mask_here >= LAYER_ICON - 0.01 ? 0.5 : (mask_here >= LAYER_OBJECT - 0.01 ? 1.0 : 0.8)) : 0.0; }
 	}
 }
 
@@ -1183,8 +1278,7 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 		float4 l = float4(0.6, 0.0, 0.6, 1);
 		if (layers_valid())
 			l = debug_mode == 2 ? layer_ground.Load(int3(id.xy, 0)) : (debug_mode == 3 ? layer_floor.Load(int3(id.xy, 0)) :
-)hlsl"
-		R"hlsl(				(debug_mode == 4 ? layer_entities.Load(int3(id.xy, 0)) : (debug_mode == 5 ? layer_world.Load(int3(id.xy, 0)) :
+				(debug_mode == 4 ? layer_entities.Load(int3(id.xy, 0)) : (debug_mode == 5 ? layer_world.Load(int3(id.xy, 0)) :
 				layer_airsplit.Load(int3(id.xy, 0)))));
 		debug_out[id.xy] = float4(l.rgb, 1);
 		return;
@@ -1224,8 +1318,8 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 		float still_zone;
 	};
 	constexpr UINT CONSTANT_COUNT = sizeof(constants) / 4;
-	constexpr UINT TABLE_SIZE = 29; // t0, u0..u21, t1..t6 (world layers)
-	constexpr UINT UAV_COUNT = 22;
+	constexpr UINT TABLE_SIZE = 31; // t0, u0..u23, t1..t6 (world layers)
+	constexpr UINT UAV_COUNT = 24;
 	constexpr UINT LAYER_SLOT = 1 + UAV_COUNT; // t1 ground, t2 entities, t3 floor, t4 post-cloud, t5 world, from this slot
 	constexpr UINT LAYER_COUNT = 6;
 	constexpr UINT STATS_BYTES = 32;  // uint[3] blocks per kind, searched, wide-searched, movers found (+ padding)
@@ -1251,6 +1345,8 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 
 		ID3D12Resource *luma_half[2] = {}, *luma_quarter[2] = {}, *luma_eighth[2] = {}, *luma_full[2] = {}, *detail_half[2] = {}, *block_mv[2] = {};
 		ID3D12Resource *sads = nullptr, *global = nullptr, *mvec = nullptr, *block_smooth = nullptr;
+		ID3D12Resource *hold = nullptr; // R8_UNORM, full res: character pixels held still (UAV state)
+		ID3D12Resource *still_score = nullptr; // R32_FLOAT, half res: averaged "stays put on screen" evidence
 		ID3D12Resource *stats = nullptr, *debug = nullptr, *depth = nullptr, *block_alt = nullptr; // block_alt: block_pre (u19)
 		ID3D12Resource *mover_out = nullptr;
 		uint32_t searched = 0, wide_searched = 0, movers = 0; // blocks, from the stats (two frames late)
@@ -1405,6 +1501,8 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 		release(m->block_smooth);
 		release(m->debug);
 		release(m->depth);
+		release(m->hold);
+		release(m->still_score);
 		release(m->block_alt);
 		release(m->mover_out);
 		m->bound_hudless = nullptr;
@@ -1443,6 +1541,8 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 		m->mvec = create_texture(w, h, DXGI_FORMAT_R16G16_FLOAT);
 		m->debug = create_texture(w, h, m->color_format);
 		m->depth = create_texture(w, h, DXGI_FORMAT_R32_FLOAT);
+		m->hold = create_texture(w, h, DXGI_FORMAT_R8_UNORM);
+		m->still_score = create_texture(m->half_w, m->half_h, DXGI_FORMAT_R32_FLOAT);
 		m->entity_mask = create_texture(m->half_w, m->half_h, DXGI_FORMAT_R32_FLOAT);
 		m->block_alt = create_buffer(static_cast<uint64_t>(block_count) * 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
 			D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -1450,7 +1550,7 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 			D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
 		m->block_smooth = create_buffer(static_cast<uint64_t>(block_count) * 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
 			D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-		if (m->mvec == nullptr || m->block_smooth == nullptr || m->depth == nullptr || m->block_alt == nullptr || m->entity_mask == nullptr ||
+		if (m->mvec == nullptr || m->block_smooth == nullptr || m->depth == nullptr || m->hold == nullptr || m->still_score == nullptr || m->block_alt == nullptr || m->entity_mask == nullptr ||
 			m->mover_out == nullptr)
 			return false;
 
@@ -1481,6 +1581,8 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 			write_buffer_uav(p, 20, m->block_alt, block_count, 16);
 			write_texture_uav(p, 21, m->entity_mask, DXGI_FORMAT_R32_FLOAT);
 			write_buffer_uav(p, 22, m->mover_out, block_count, 16);
+			write_texture_uav(p, 23, m->hold, DXGI_FORMAT_R8_UNORM);
+			write_texture_uav(p, 24, m->still_score, DXGI_FORMAT_R32_FLOAT);
 		}
 		m->history = 0;
 		return true;
@@ -1907,7 +2009,9 @@ namespace motion
 			| (layers ? 256u : 0u)
 			| ((options.debug_layer_view & 7u) << 9)
 			| (options.icons_first ? 4096u : 0u)
-			| (options.wide_search ? 8192u : 0u);
+			| (options.wide_search ? 8192u : 0u)
+			| (options.spread_depth ? 16384u : 0u)
+			| (options.hold_as_ground ? 32768u : 0u);
 		// SAD units: sum over 64 half-res pixels of |luma difference| (each 0..1)
 		c.penalty_zero = options.penalty_zero;
 		c.penalty_other = options.penalty_zero * 1.4f;
@@ -2156,6 +2260,11 @@ namespace motion
 	bool layers_used()
 	{
 		return m != nullptr && m->layers_used;
+	}
+
+	ID3D12Resource *hold_texture()
+	{
+		return m != nullptr ? m->hold : nullptr;
 	}
 
 	ID3D12Resource *depth_texture()

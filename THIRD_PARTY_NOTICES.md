@@ -1,6 +1,6 @@
 # Third-party notices
 
-This add-on is built with the following third-party code. Their licences are compatible with the MIT licence of the
+This add-on is built with, and its release zip contains, the following third-party code. Their licences are compatible with the MIT licence of the
 add-on itself (`LICENSE`) and require their notices to be kept; the full texts are in `third_party\`.
 
 | Component | Used for | Licence | Copyright |
@@ -8,6 +8,8 @@ add-on itself (`LICENSE`) and require their notices to be kept; the full texts a
 | ReShade add-on API headers (`third_party/reshade`) | Hooking Factorio's DirectX 11 rendering | BSD 3-Clause (`third_party/reshade/LICENSE.md`) | Copyright 2014 Patrick Mours |
 | Dear ImGui headers (`third_party/imgui`) | The settings window and readout, drawn through ReShade | MIT (`third_party/imgui/LICENSE.txt`) | Copyright (c) 2014-2025 Omar Cornut |
 | NVIDIA Streamline SDK headers (`third_party/streamline`) | Calling DLSS Frame Generation | MIT (`third_party/streamline/license.txt`) | Copyright (c) 2023 NVIDIA CORPORATION |
+| AMD FSR API and frame generation headers (`third_party/fidelityfx`) | Calling FSR Frame Generation | MIT, as listed in `third_party/fidelityfx/license.md` | Copyright (C) Advanced Micro Devices, Inc. |
+| AMD FSR DLLs `amd_fidelityfx_loader_dx12.dll`, `amd_fidelityfx_framegeneration_dx12.dll` (in the release zip, from FSR SDK 2.3.0) | FSR Frame Generation at run time | MIT, as listed in the same file (shipped as `AMD_FidelityFX_license.md`) | Copyright (C) Advanced Micro Devices, Inc. |
 
 Not included, downloaded separately by the user, each under its own terms:
 
@@ -16,5 +18,5 @@ Not included, downloaded separately by the user, each under its own terms:
   NVIDIA's licence for those binaries.
 - **dlssg_for_sm86** (RTX 20/30 only), a third-party, unofficial project.
 
-Factorio is a trademark of Wube Software. NVIDIA, RTX and DLSS are trademarks of NVIDIA Corporation. This project is
-not affiliated with or endorsed by either.
+Factorio is a trademark of Wube Software. NVIDIA, RTX and DLSS are trademarks of NVIDIA Corporation. AMD, FSR and
+FidelityFX are trademarks of Advanced Micro Devices, Inc. This project is not affiliated with or endorsed by any of them.

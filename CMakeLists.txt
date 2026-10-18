@@ -25,15 +25,22 @@ add_library(hudless_probe SHARED
   src/hudless_probe.cpp
   src/bridge.cpp
   src/bridge.h
+  src/fg.cpp
+  src/fg.h
   src/fg_streamline.cpp
   src/fg_streamline.h
+  src/fg_fsr.cpp
+  src/fg_fsr.h
+  src/ui_layer.cpp
+  src/ui_layer.h
   src/motion.cpp
   src/motion.h
   src/version.h
   src/version.rc
   src/setup_check.cpp
   src/setup_check.h)
-target_include_directories(hudless_probe PRIVATE "${RESHADE_DIR}/include" "${IMGUI_DIR}" "${STREAMLINE_DIR}/include")
+target_include_directories(hudless_probe PRIVATE "${RESHADE_DIR}/include" "${IMGUI_DIR}" "${STREAMLINE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fidelityfx/api/include" "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fidelityfx/framegeneration/include")
 target_compile_definitions(hudless_probe PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(hudless_probe PRIVATE d3d11 d3d12 dxgi wintrust crypt32 advapi32)
 

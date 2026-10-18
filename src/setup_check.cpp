@@ -4,12 +4,14 @@
 
 #include <winver.h>
 #include <dxgi.h>
+#include <cstdint>
 #include <cstdio>
 
 namespace
 {
 	std::vector<setup::item> g_items;
 	std::string g_factorio_version;
+	uint32_t g_gpu_vendor = 0; // of the GPU the checks looked at (NVIDIA preferred)
 
 	std::wstring folder_of(const std::wstring &path)
 	{
@@ -146,6 +148,7 @@ namespace
 			factory->Release();
 			if (found)
 			{
+				g_gpu_vendor = chosen.VendorId;
 				gpu = narrow(chosen.Description);
 				result = hags_from_kernel(chosen.AdapterLuid);
 			}
@@ -196,25 +199,32 @@ namespace setup
 				add("GPU scheduling (HAGS)", state::warning, "could not be determined; make sure it is on (Windows Settings > System > Display > Graphics)");
 		}
 
-		// Streamline
+		// Frame generation: DLSS-G (Streamline + NVIDIA RTX, dlssg_for_sm86 on RTX 20/30) and/or FSR (AMD's DLLs).
+		// One of the two is enough; only when neither is usable is it a problem.
+		bool dlssg_ok = false, fsr_ok = false;
+		const bool nvidia = g_gpu_vendor == 0x10DE;
 		{
 			const wchar_t *const files[] = { L"sl.interposer.dll", L"sl.common.dll", L"sl.dlss_g.dll", L"sl.reflex.dll", L"sl.pcl.dll", L"nvngx_dlssg.dll" };
 			std::string missing;
 			for (const wchar_t *f : files)
 				if (!exists(game_dir + L"fg\\" + f))
 					missing += (missing.empty() ? "" : ", ") + narrow(f);
-			if (!missing.empty())
-				add("Streamline (bin\\x64\\fg\\)", state::problem, "missing: " + missing + " (Streamline 2.14.16 release, bin\\x64)");
+			if (!nvidia)
+				add("DLSS-G (Streamline, bin\\x64\\fg\\)", state::ok, "not used: needs an NVIDIA RTX GPU (FSR is used instead)");
+			else if (!missing.empty())
+				add("DLSS-G (Streamline, bin\\x64\\fg\\)", state::warning, "not installed, missing: " + missing + " (Streamline 2.14.16 release, bin\\x64)");
 			else
 			{
 				const std::string v = file_version(game_dir + L"fg\\sl.interposer.dll");
 				const bool expected = v.rfind("2.14.16", 0) == 0;
-				add("Streamline (bin\\x64\\fg\\)", expected ? state::ok : state::warning,
+				add("DLSS-G (Streamline, bin\\x64\\fg\\)", expected ? state::ok : state::warning,
 					"all files present, sl.interposer " + (v.empty() ? std::string("version unknown") : v) + (expected ? "" : " (built against 2.14.16)"));
+				dlssg_ok = true;
 			}
 		}
 
-		// dlssg_for_sm86 (only needed on RTX 20/30)
+		// dlssg_for_sm86 (only needed for DLSS-G on RTX 20/30)
+		if (nvidia && dlssg_ok)
 		{
 			const bool proxy = exists(game_dir + L"version.dll");
 			const bool ini = exists(game_dir + L"dlssg_sm86.ini");
@@ -223,8 +233,23 @@ namespace setup
 				add("dlssg_for_sm86", state::ok, "version.dll, dlssg_sm86.ini, dlssg_sm86\\ present");
 			else
 				add("dlssg_for_sm86", state::warning, std::string("incomplete (") + (proxy ? "" : "version.dll ") + (ini ? "" : "dlssg_sm86.ini ") +
-					(dir ? "" : "dlssg_sm86\\ ") + "missing): needed on RTX 20/30, not on RTX 40/50");
+					(dir ? "" : "dlssg_sm86\\ ") + "missing): needed for DLSS-G on RTX 20/30, not on RTX 40/50");
 		}
+
+		// AMD FSR Frame Generation (any DirectX 12 GPU)
+		{
+			const bool loader = exists(game_dir + L"amd_fidelityfx_loader_dx12.dll");
+			const bool framegen = exists(game_dir + L"amd_fidelityfx_framegeneration_dx12.dll");
+			fsr_ok = loader && framegen;
+			if (fsr_ok)
+				add("AMD FSR Frame Generation (bin\\x64)", state::ok, "amd_fidelityfx_loader_dx12.dll, amd_fidelityfx_framegeneration_dx12.dll present");
+			else
+				add("AMD FSR Frame Generation (bin\\x64)", state::warning, std::string("not installed, missing: ") + (loader ? "" : "amd_fidelityfx_loader_dx12.dll ") +
+					(framegen ? "" : "amd_fidelityfx_framegeneration_dx12.dll") + " (both come with this add-on's release zip)");
+		}
+		if (!dlssg_ok && !fsr_ok)
+			add("Frame generation", state::problem, nvidia ? "neither DLSS-G nor FSR is installed: install either (see the README)"
+				: "AMD FSR Frame Generation is not installed: copy its two DLLs from the release zip into bin\\x64");
 
 		// Shader compiler for the motion vectors
 		{

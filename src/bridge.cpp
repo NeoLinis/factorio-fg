@@ -6,7 +6,8 @@
 // so D3D11 never overwrites a shared texture D3D12 is still reading, and D3D12 never reads a half-written one.
 
 #include "bridge.h"
-#include "fg_streamline.h"
+#include "fg.h"
+#include "ui_layer.h"
 #include "motion.h"
 
 #include <d3d11_4.h>
@@ -58,7 +59,7 @@ namespace
 		com<IDXGIFactory4> sc_factory;   // creates the swap chain: Streamline proxy when frame generation is on
 		com<ID3D12Device> dev12;          // native device, used for everything Streamline does not intercept
 		com<ID3D12Device> dev12_proxy;    // Streamline proxy device (only for CreateCommandQueue)
-		bool fg = false;                  // Streamline / DLSS-G attached
+		bool fg = false;                  // a frame generation backend (DLSS-G or FSR) attached, see fg.h
 		com<ID3D12CommandQueue> queue;
 		com<ID3D12CommandAllocator> allocators[BACK_BUFFERS];
 		uint64_t allocator_fence[BACK_BUFFERS] = {};
@@ -265,8 +266,11 @@ namespace
 			if (FAILED(s->swapchain->ResizeBuffers(BACK_BUFFERS, w, h, s->format, flags)))
 				return false;
 			if (s->fg)
+				fg::resized(w, h);
+			if (s->fg)
 				fg::reset_history();
 			motion::resize(w, h);
+			ui_layer::resize(w, h);
 		}
 		else
 		{
@@ -282,7 +286,15 @@ namespace
 			desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
 			desc.Flags = flags;
 			com<IDXGISwapChain1> sc1;
-			if (FAILED(s->sc_factory->CreateSwapChainForHwnd(s->queue.get(), s->child, &desc, nullptr, nullptr, sc1.put())))
+			if (s->fg && fg::creates_swapchain())
+			{
+				// FSR: its frame generation swap chain (a proxy that inserts the generated frames and paces them)
+				IDXGISwapChain4 *sc4 = nullptr;
+				if (!fg::create_swapchain(s->child, desc, s->sc_factory.get(), s->queue.get(), &sc4))
+					return false;
+				sc1.p = sc4;
+			}
+			else if (FAILED(s->sc_factory->CreateSwapChainForHwnd(s->queue.get(), s->child, &desc, nullptr, nullptr, sc1.put())))
 				return false;
 			s->sc_factory->MakeWindowAssociation(s->child, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
 			if (FAILED(sc1->QueryInterface(IID_PPV_ARGS(s->swapchain.put()))))
@@ -341,31 +353,18 @@ namespace
 			return false;
 		}
 
-		// ---- Streamline / DLSS-G (optional). Everything below falls back to plain D3D12 if it is unavailable.
-		if (fg::load(s->log) && fg::begin())
+		// ---- Frame generation backend (optional): DLSS-G or FSR, see fg.h. Everything below falls back to plain
+		// D3D12 presentation if neither is available.
 		{
-			s->fg = fg::attach(s->dev12.get(), adapter_desc.AdapterLuid, width, height);
-			if (s->fg)
-			{
-				IDXGIFactory4 *proxy_factory = nullptr;
-				ID3D12Device *proxy_device = s->dev12.get();
-				proxy_device->AddRef();
-				if (SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&proxy_factory))) && fg::upgrade(proxy_factory) && fg::upgrade(proxy_device))
-				{
-					s->sc_factory.p = proxy_factory;
-					s->dev12_proxy.p = proxy_device;
-				}
-				else
-				{
-					log_line("bridge: Streamline interface upgrade failed, continuing without frame generation");
-					if (proxy_factory != nullptr) proxy_factory->Release();
-					proxy_device->Release();
-					fg::detach();
-					s->fg = false;
-				}
-			}
-			if (!s->fg)
-				fg::end();
+			IDXGIFactory4 *proxy_factory = nullptr;
+			ID3D12Device *proxy_device = nullptr;
+			const fg::backend b = fg::start(s->dev12.get(), adapter_desc.AdapterLuid, adapter_desc.VendorId, width, height, s->format, s->log,
+				&proxy_factory, &proxy_device);
+			s->fg = b != fg::backend::none;
+			if (proxy_factory != nullptr)
+				s->sc_factory.p = proxy_factory; // DLSS-G: Streamline's proxies create the queue and the swap chain
+			if (proxy_device != nullptr)
+				s->dev12_proxy.p = proxy_device;
 		}
 		if (!s->sc_factory)
 		{
@@ -373,7 +372,11 @@ namespace
 			s->sc_factory.p = s->factory.get();
 		}
 		if (s->fg)
+		{
 			motion::init(s->dev12.get(), width, height, s->format, s->log);
+			if (ui_layer::init(s->dev12.get(), s->format, s->log))
+				ui_layer::resize(width, height);
+		}
 
 		com<IDXGIFactory5> factory5;
 		if (SUCCEEDED(s->factory->QueryInterface(IID_PPV_ARGS(factory5.put()))))
@@ -432,7 +435,7 @@ namespace
 
 		log_line("bridge: D3D12 device on '%ls', %ux%u format %d, %u buffers, tearing %s, frame generation %s",
 			adapter_desc.Description, width, height, static_cast<int>(s->format), BACK_BUFFERS, s->tearing_supported ? "yes" : "no",
-			s->fg ? "available" : "unavailable");
+			s->fg ? fg::name(fg::current()) : "unavailable");
 		return true;
 	}
 }
@@ -502,8 +505,11 @@ namespace bridge
 		// Release the swap chain before its window goes away, and all Streamline objects before slShutdown.
 		for (auto &b : s->back_buffers)
 			b.reset();
+		if (s->fg)
+			fg::before_swapchain_release();
 		s->swapchain.reset();
 		motion::shutdown();
+		ui_layer::shutdown();
 		if (s->fg)
 			fg::detach();
 		s->sc_factory.reset();
@@ -582,6 +588,16 @@ namespace bridge
 	const char *status()
 	{
 		return s != nullptr ? s->status : g_status_off;
+	}
+
+	uint32_t max_multiplier()
+	{
+		return s != nullptr && s->fg ? fg::max_multiplier() : 4u;
+	}
+
+	const char *backend_name()
+	{
+		return s != nullptr && s->fg ? fg::name(fg::current()) : "none";
 	}
 
 	const char *fg_status()
@@ -752,6 +768,8 @@ namespace bridge
 		{
 			ID3D12Resource *mvec = nullptr;
 			ID3D12Resource *depth = nullptr;
+			ID3D12Resource *hold = nullptr; // character pixels held still (FSR shows them from the real frame)
+			bool back_is_final = true; // false while the motion debug picture replaces the game picture
 			if (hudless != nullptr && motion::active())
 			{
 				motion::settings ms;
@@ -780,6 +798,9 @@ namespace bridge
 				ms.debug_layer_view = options.motion_debug_layer_view;
 				ms.icons_first = options.motion_icons_first;
 				ms.wide_search = options.motion_wide_search;
+				ms.spread_depth = fg::current() == fg::backend::fsr;
+				ms.hold_as_ground = options.fg_hold_character && options.fg_inpaint_character && !options.fg_show_ui_layer &&
+					options.fg_multiplier > 1 && !options.motion_debug_view;
 				motion::layer_set ls;
 				if (layers)
 				{
@@ -803,7 +824,10 @@ namespace bridge
 				if (split.submitted)
 					waited_for_shared = true;
 				if (mvec != nullptr)
+				{
 					depth = motion::depth_texture(); // from the world layers; flat when they are not available
+					hold = motion::hold_texture();
+				}
 				if (ID3D12Resource *debug = motion::debug_texture())
 				{
 					// show the motion debug picture instead of the game picture
@@ -812,6 +836,7 @@ namespace bridge
 					transition(debug, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE, db[1]);
 					s->list->ResourceBarrier(2, db);
 					s->list->CopyResource(back, debug);
+					back_is_final = false;
 					transition(back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT, db[0]);
 					transition(debug, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, db[1]);
 					s->list->ResourceBarrier(2, db);
@@ -857,23 +882,69 @@ namespace bridge
 					}
 				}
 			}
-			fg::before_present(s->list.get(), hudless != nullptr ? s->hudless12.get() : nullptr, mvec, depth, s->width, s->height, options.fg_multiplier);
+			const int multiplier = back_is_final ? options.fg_multiplier : 1; // paused under the motion debug view
+			// The UI layer (GUI and held character from the real frame) and the clean frame, for either technology.
+			ID3D12Resource *ui = nullptr, *clean = nullptr;
+			if (multiplier > 1 && hudless != nullptr)
+			{
+				ui_layer::inputs in;
+				in.final_frame = s->final12.get();
+				in.hudless = s->hudless12.get();
+				in.hold = options.fg_hold_character ? hold : nullptr;
+				in.floor = layers ? s->layer12[set][LAYER_FLOOR].get() : nullptr;
+				in.objects = layers ? s->layer12[set][LAYER_ENTITIES].get() : nullptr;
+				in.inpaint = options.fg_inpaint_character && !options.fg_show_ui_layer;
+				if (ui_layer::record(s->list.get(), in))
+				{
+					ui = ui_layer::ui_texture();
+					clean = ui_layer::clean_texture();
+				}
+			}
+			fg::set_debug_view(options.fg_debug_view);
+			fg::set_only_generated(options.fg_only_generated);
+			fg::before_present(s->list.get(), back, hudless != nullptr ? s->hudless12.get() : nullptr, ui, clean, mvec, depth, s->width, s->height,
+				multiplier);
+			if (ui != nullptr && options.fg_show_ui_layer && s->format == DXGI_FORMAT_R8G8B8A8_UNORM)
+			{
+				// diagnostic: the UI layer itself in the back buffer (black where there is none)
+				D3D12_RESOURCE_BARRIER sb[2];
+				transition(back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST, sb[0]);
+				transition(ui, ui_layer::ui_state(), D3D12_RESOURCE_STATE_COPY_SOURCE, sb[1]);
+				s->list->ResourceBarrier(2, sb);
+				s->list->CopyResource(back, ui);
+				transition(back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT, sb[0]);
+				transition(ui, D3D12_RESOURCE_STATE_COPY_SOURCE, ui_layer::ui_state(), sb[1]);
+				s->list->ResourceBarrier(2, sb);
+			}
 		}
 		s->list->Close();
 
 		if (!waited_for_shared)
 			s->queue->Wait(s->shared_fence12.get(), written);
 		s->queue->ExecuteCommandLists(1, lists);
-		s->queue->Signal(s->shared_fence12.get(), ++s->shared_value);
+		// FSR generates the extra frame inside Present on this queue, reading the HUD-less copy: D3D11 may only
+		// overwrite the shared textures once that has run, so the fence follows Present there.
+		const bool signal_late = s->fg && fg::signal_after_present();
+		if (!signal_late)
+			s->queue->Signal(s->shared_fence12.get(), ++s->shared_value);
 		s->queue->Signal(s->frame_fence.get(), ++s->frame_fence_value);
 		s->allocator_fence[index] = s->frame_fence_value;
 
 		const bool tear = options.allow_tearing && s->tearing_supported;
 		if (s->fg)
 			fg::present_start();
-		const HRESULT hr = s->swapchain->Present(tear ? 0 : 1, tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
+		HRESULT hr = s->swapchain->Present(tear ? 0 : 1, tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
+		if (hr == DXGI_ERROR_INVALID_CALL && tear)
+		{
+			// a swap chain that refuses tearing in this window mode (FSR's): present with sync from now on
+			log_line("bridge: present with tearing refused, using sync interval 1");
+			s->tearing_supported = false;
+			hr = s->swapchain->Present(1, 0);
+		}
 		if (s->fg)
 			fg::present_end();
+		if (signal_late)
+			s->queue->Signal(s->shared_fence12.get(), ++s->shared_value);
 		if (FAILED(hr))
 		{
 			log_line("bridge: Present failed (0x%08X), shutting down", static_cast<unsigned>(hr));
