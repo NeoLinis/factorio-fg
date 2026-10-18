@@ -1,0 +1,6 @@
+build/
+build_release/
+dist/
+*.addon64
+*.addon32
+factorio_fg_shaders.cache
