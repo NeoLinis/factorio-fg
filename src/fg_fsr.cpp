@@ -447,7 +447,7 @@ namespace fg_fsr
 		std::snprintf(g_depth_status, sizeof(g_depth_status), "%s", depth_layers != nullptr ? "world layers passed to FSR" : "flat (no layers this frame)");
 		if (g_ui_mode)
 			set_status("FSR FG %s | 2x | UI separated, GUI %.1f%% of the screen%s%s", g_version, ui_layer::coverage() * 100.0f,
-				clean != nullptr ? " | character painted over" : "", g_only_generated ? " | GENERATED FRAMES ONLY" : "");
+				clean != nullptr && ui_layer::inpainted() ? " | character painted over" : "", g_only_generated ? " | GENERATED FRAMES ONLY" : "");
 		else
 			set_status("FSR FG %s | 2x | UI %s", g_version, hudless != nullptr ? "detected by FSR" : "not separated (no HUD-less frame)");
 	}

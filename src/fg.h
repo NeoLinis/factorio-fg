@@ -60,6 +60,8 @@ namespace fg
 	void end();
 
 	const char *status();
+	// The UI layer will be laid over the generated frames (DLSS-G has not refused UI recomposition).
+	bool ui_layer_usable();
 	const char *depth_status();
 	uint32_t frames_per_present();
 	uint32_t max_multiplier();          // DLSS-G: what the system reports (up to 4); FSR: 2

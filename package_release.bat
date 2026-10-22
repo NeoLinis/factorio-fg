@@ -1,5 +1,5 @@
 @echo off
-rem Builds the release add-on and zips it with AMD's FSR frame generation DLLs, the README, changelog and licences: dist\factorio-fg-<version>.zip
+rem Builds the release add-on and zips it with AMD's FSR frame generation DLLs, the README, docs, changelog and licences: dist\factorio-fg-<version>.zip
 setlocal
 cd /d "%~dp0"
 for /f "tokens=3" %%v in ('findstr /c:"#define ADDON_VERSION_STRING" src\version.h') do set "VER=%%~v"
@@ -16,6 +16,8 @@ copy /y third_party\fidelityfx\bin\amd_fidelityfx_loader_dx12.dll "%OUT%\" >nul 
 copy /y third_party\fidelityfx\bin\amd_fidelityfx_framegeneration_dx12.dll "%OUT%\" >nul || goto :fail
 copy /y third_party\fidelityfx\license.md "%OUT%\AMD_FidelityFX_license.md" >nul || goto :fail
 copy /y README.md "%OUT%\" >nul || goto :fail
+mkdir "%OUT%\docs" || goto :fail
+copy /y docs\HOW_IT_WORKS.md "%OUT%\docs\" >nul || goto :fail
 copy /y CHANGELOG.md "%OUT%\" >nul || goto :fail
 copy /y LICENSE "%OUT%\LICENSE.txt" >nul || goto :fail
 copy /y THIRD_PARTY_NOTICES.md "%OUT%\" >nul || goto :fail

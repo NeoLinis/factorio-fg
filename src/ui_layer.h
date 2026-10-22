@@ -7,6 +7,8 @@
 //   (UI color and alpha, with enableUserInterfaceRecomposition).
 // - optionally the "clean" frame: the HUD-less frame with the held character painted over by what is under it
 //   (world snapshots taken before it is drawn), so frame generation blends only the world around the character.
+// - 1.2: the character's shadow as a darkening (black at its measured darkness) in the UI layer, and taken out of the
+//   clean frame: the ground under it moves with the camera, the shadow stays put with the character.
 
 #pragma once
 
@@ -25,6 +27,10 @@ namespace ui_layer
 		ID3D12Resource *floor = nullptr;       // floor snapshot (COMMON), for painting the character over on the ground
 		ID3D12Resource *objects = nullptr;     // objects snapshot (COMMON), ... in flight
 		bool inpaint = false;                  // paint the held character over in the clean frame
+		bool hold_character = true;            // lay the held character over (else frame generation shows it generated)
+		bool exact = false;                    // the hold comes from the exact character mask: grow it by 1 px, not 2
+		bool shadow = false;                   // the hold may carry the shadow's darkening (values below 0.25): lay it
+		                                       // over and take the shadow out of the clean frame
 	};
 
 	// Once per device; 'format' is the frame format (typed, non-sRGB).
@@ -37,7 +43,7 @@ namespace ui_layer
 	bool record(ID3D12GraphicsCommandList *list, const inputs &in);
 	ID3D12Resource *ui_texture();
 	D3D12_RESOURCE_STATES ui_state();       // NON_PIXEL_SHADER_RESOURCE | PIXEL_SHADER_RESOURCE
-	ID3D12Resource *clean_texture();
+	ID3D12Resource *clean_texture();        // null if not written this frame
 	D3D12_RESOURCE_STATES clean_state();    // ... | COPY_SOURCE
 
 	float coverage();     // share of the screen in the UI layer (two frames old), -1 if unknown

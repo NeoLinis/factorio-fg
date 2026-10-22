@@ -181,6 +181,11 @@ namespace fg
 			fg_fsr::before_present(list, back_buffer, hudless, ui, clean, motion_vectors, depth_layers, width, height, multiplier);
 	}
 
+	bool ui_layer_usable()
+	{
+		return g_current == backend::fsr || (g_current == backend::dlssg && fg_sl::ui_supported());
+	}
+
 	void present_start()
 	{
 		if (g_current == backend::dlssg)

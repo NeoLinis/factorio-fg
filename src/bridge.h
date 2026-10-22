@@ -32,6 +32,8 @@ namespace bridge
 		bool fg_hold_character = true; // FSR: the held character from the newest real frame (no blended poses)
 		bool fg_inpaint_character = false; // FSR: and painted over in what FSR interpolates (ground only)
 		bool fg_only_generated = false;    // FSR: present only the generated frames (diagnostic)
+		bool fg_shadow_overlay = true;     // 1.2, exact mask: the character's shadow laid over as a darkening (the ground
+		                                   // under it moves with the camera) once its darkness is measured
 		float motion_far_penalty = 0.1f;
 		float motion_still_zone = 0.25f;
 		bool motion_mover_search = true;
@@ -39,9 +41,11 @@ namespace bridge
 		uint32_t motion_debug_layer_view = 0;
 		bool motion_icons_first = true;
 		bool motion_wide_search = true;
+		bool motion_floor_camera = true;      // 1.2: belts and other floor move with the world (see motion::settings)
 		bool scene_cut_detection = true;      // tell DLSS-G to start over when the picture changes completely
 		float scene_cut_factor = 4.0f;        // cut when the frame difference exceeds this many times its running average
-		float scene_cut_min_difference = 0.04f; // ...and this absolute mean luma difference (0..1)
+		float scene_cut_min_difference = 0.08f; // ...and this absolute mean luma difference (0..1); 0.04 until beta 34 cut
+		                                        // on zooming, explosions and fast turns (0.04-0.09) many times a minute
 	};
 
 	struct timings
@@ -51,6 +55,10 @@ namespace bridge
 		uint32_t blocks_searched = 0, blocks_wide = 0, movers_found = 0; // mover search work last frame
 		float cut_wait_ms = 0;    // CPU wait for the scene-cut check (includes Factorio's own GPU work still in flight)
 		float present_cpu_ms = 0; // total CPU time of bridge::present
+		float last_cut_wait_ms = 0, last_present_cpu_ms = 0; // the same for the last frame alone (not smoothed)
+		uint32_t cut_checks_late = 0, cuts_late = 0; // scene-cut checks judged a frame late (GPU busy), cuts found so
+		float last_alloc_wait_ms = 0;    // the last frame: waiting for the GPU to free a command allocator (3 frames back)
+		float last_present_call_ms = 0;  // ... inside the swap chain's Present (frame generation, its pacing)
 		float difference = 0, difference_average = 0; // scene-cut metric, last and running average
 		uint32_t scene_cuts = 0;
 	};
@@ -65,8 +73,14 @@ namespace bridge
 	// World layer snapshots: array of LAYER_COUNT textures indexed by 'layer' (all must be set), or null.
 	enum layer : uint32_t { LAYER_GROUND, LAYER_FLOOR, LAYER_ENTITIES, LAYER_POSTCLOUD, LAYER_WORLD, LAYER_AIRSPLIT, LAYER_COUNT };
 	// 'layers_generation': layer_generation() when the snapshots were taken (they are ignored if it changed since).
+	// 'character_mask' (1.2, may be null): the exact character mask of this frame (R8G8B8A8_UNORM, the frame's size:
+	// R character, G its shadow, B flying). With it the motion pass does not guess the character.
 	void present(ID3D11DeviceContext *context, ID3D11Texture2D *final_frame, ID3D11Texture2D *hudless,
-		ID3D11Texture2D *const *layers, uint64_t layers_generation, const present_options &options);
+		ID3D11Texture2D *const *layers, uint64_t layers_generation, ID3D11Texture2D *character_mask, const present_options &options);
+	bool exact_mask_used(); // the last frame's motion pass used the exact character mask
+	// The character's shadow darkness (motion::shadow_darkness): true if it is laid over as a darkening.
+	struct shadow_info { float k[4]; uint32_t frames[4], samples[4]; }; // as motion::shadow_info
+	bool shadow_darkness(shadow_info &out);
 	// The texture to copy this frame's snapshot of 'layer' into directly (D3D11, on Factorio's device), or null when
 	// the bridge is not running. Saves a full-screen copy per layer at present. Valid while layer_generation() is
 	// unchanged; the next frame gets the other of two sets.

@@ -86,6 +86,11 @@ Texture2D<float4> layer_world : register(t5);
 // The air stage split in two at the first draw of one shader (the air split snapshot): alt-mode icons on one side
 // (they sit on buildings: camera motion, unless that clearly does not match), flying robots and effects on the other.
 Texture2D<float4> layer_airsplit : register(t6);
+// The exact character mask (1.2, from Factorio's own sprites): R the character, G its shadow, B the character flying.
+// With it (flag 65536) nothing is guessed: those pixels stay put on screen (the camera follows the character), and
+// nothing else is held.
+Texture2D<float4> char_mask : register(t7);
+bool exact_mask() { return (flags & 65536) != 0; }
 #define LAYER_FLOOR (1.0 / 3.0)
 #define LAYER_OBJECT (2.0 / 3.0)
 #define LAYER_ICON (5.0 / 6.0)
@@ -316,7 +321,76 @@ void cs_global_zoom(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 	if (gi == 0) sads[ZOOM_BASE + (gid.z * NS + gid.y) * ZTN * ZTN + gid.x] = encode_sad(sum, count);
 }
 
-[numthreads(1, 1, 1)]
+// Shadow darkness (1.2): how much the character's shadow darkens what is under it, per unit of its mask coverage (G).
+// Factorio draws shadows into their own target and blends that in, so a shadow is a darkening of whatever is under
+// it. With the darkness known, frame generation gets the picture without the shadow (moving with the camera) and the
+// shadow as a darkening in the UI layer that stays put with the character.
+// Measured in cs_expand where the camera moves the world across the shadow's edge: the same point inside the shadow in
+// one frame and outside it in the other. Four classes, as they may differ: walking / flying (the mask's B on the
+// shadow) x on ground and floor / on objects (an object drawn after the shadow is not darkened by it - unless the
+// flying shadow is blended in later; the measurement tells). stats[]: SH_K + class the running value (float bits),
+// SH_FRAMES + class frames it was measured in, SH_SAMPLES + class samples last frame, SH_COUNT + class samples this
+// frame, SH_HIST + class x SH_BINS .. this frame's histogram (darkness per coverage in 1/SH_BINS steps, weighted by
+// the coverage x 16).
+#define SH_K 8
+#define SH_FRAMES 12
+#define SH_SAMPLES 16
+#define SH_COUNT 20
+#define SH_HIST 32
+#define SH_BINS 32
+#define SH_CLASSES 4
+#define SH_MIN_SAMPLES 60
+void shadow_finish()
+{
+	[loop] for (uint cls = 0; cls < SH_CLASSES; ++cls)
+	{
+		const uint h = SH_HIST + cls * SH_BINS;
+		if (frame == 0)
+		{
+			stats[SH_K + cls] = 0; stats[SH_FRAMES + cls] = 0; stats[SH_SAMPLES + cls] = 0; stats[SH_COUNT + cls] = 0;
+			[loop] for (uint z = 0; z < SH_BINS; ++z) stats[h + z] = 0;
+			continue;
+		}
+		uint total = 0;
+		[loop] for (uint i = 0; i < SH_BINS; ++i) total += stats[h + i];
+		const uint count = stats[SH_COUNT + cls];
+		stats[SH_SAMPLES + cls] = count;
+		if (count >= SH_MIN_SAMPLES && total > 0)
+		{
+			// weighted median: robust against what did not match (animated water and machines, a passing bot)
+			const float half_w = 0.5 * float(total);
+			float acc = 0.0, k = 0.0;
+			[loop] for (uint j = 0; j < SH_BINS; ++j)
+			{
+				const float w = float(stats[h + j]);
+				if (w > 0.0 && acc + w >= half_w)
+				{
+					k = (float(j) + saturate((half_w - acc) / w)) / float(SH_BINS);
+					break;
+				}
+				acc += w;
+			}
+			const uint n = stats[SH_FRAMES + cls];
+			const float old_k = asfloat(stats[SH_K + cls]);
+			// a plain average over the first 10 frames, then a slow running average
+			const float rate = max(0.1, 1.0 / float(n + 1));
+			const float nk = n == 0 || !(old_k >= 0.0 && old_k < 1.0) ? k : lerp(old_k, k, rate);
+			stats[SH_K + cls] = asuint(clamp(nk, 0.0, 0.95));
+			stats[SH_FRAMES + cls] = min(n + 1, 1000000u);
+		}
+		stats[SH_COUNT + cls] = 0;
+		[loop] for (uint b = 0; b < SH_BINS; ++b) stats[h + b] = 0;
+	}
+}
+// Darkness per unit of coverage of one class once measured in a few frames, else -1.
+float shadow_k(uint cls)
+{
+	const float k = asfloat(stats[SH_K + cls]);
+	return stats[SH_FRAMES + cls] >= 3 && k >= 0.0 && k < 1.0 ? k : -1.0;
+}
+
+)hlsl"
+		R"hlsl([numthreads(1, 1, 1)]
 void cs_global_coarse_pick(uint3 id : SV_DispatchThreadID)
 {
 	int2 pc = predicted_center();
@@ -361,6 +435,7 @@ void cs_global_coarse_pick(uint3 id : SV_DispatchThreadID)
 	global_motion[2] = float4(float2(bd), confidence, float(best));
 	global_motion[6] = float4(a, zc, 0);
 	stats[0] = 0; stats[1] = 0; stats[2] = 0; stats[3] = 0; stats[4] = 0; stats[5] = 0;
+	shadow_finish();
 }
 
 // Zoom-aware SAD at one level: pan t and zoom a about z (both in that level's px).
@@ -1007,6 +1082,39 @@ void cs_block(uint3 id : SV_DispatchThreadID)
 		block_mv[bi] = float2(0, 0); // still on screen: exactly zero, no sub-pixel jitter
 		return;
 	}
+	// Own motion on belts and other floor (1.2): an empty belt's surface is a repeating pattern (the chevrons) that
+	// scrolls, so shifts by one repeat match as well as its real motion - blocks of one belt took opposite directions and
+	// kept them (stuck, blurred lanes). Along the motion's axis, any other shift (2+ half-res px away) that matches nearly
+	// as well makes it ambiguous: the camera then (the pattern cross-fades, but nothing moves the wrong way). A real
+	// mover over the floor (a bot, items on a sparse belt) matches only at its own motion and keeps it.
+	[branch] if (layers_valid())
+	{
+		uint floor_px = 0, upper_px = 0;
+		[unroll] for (int my = 0; my < 8; ++my)
+		[unroll] for (int mx = 0; mx < 8; ++mx)
+		{
+			const float mk = entity_mask[min(base + int2(mx, my), int2(half_size) - 1)];
+			floor_px += (mk > 0.0 && mk < LAYER_OBJECT - 0.01) ? 1u : 0u;
+			upper_px += mk >= LAYER_OBJECT - 0.01 ? 1u : 0u;
+		}
+		[branch] if (floor_px >= 24 && upper_px <= 8)
+		{
+			const int2 rel = best - gi;
+			const int2 axis = abs(rel.x) >= abs(rel.y) ? int2(sign(rel.x), 0) : int2(0, sign(rel.y));
+			bool ambiguous = false;
+			[loop] for (int r = -6; r <= 6 && !ambiguous; ++r)
+			{
+				const int2 d = gi + axis * r;
+				if (all(abs(d - best) <= 1) || !inside(base, d)) continue;
+				ambiguous = block_sad(base, d) <= 1.3 * best_sad + 0.05;
+			}
+			if (ambiguous)
+			{
+				block_mv[bi] = camera_mark;
+				return;
+			}
+		}
+	}
 	float sp[4]; // left, right, up, down
 	[loop] for (int k = 0; k < 4; ++k)
 	{
@@ -1093,6 +1201,60 @@ float pixel_sad(int2 p, int2 d)
 // Repeating-pattern guard per pixel, capped: a repeat is a few icons / belt lanes away, while a fast train found by
 // the wide search can be 100 px from the camera and must not lose its edges to the distance cost.
 #define FAR_CAP 24.0
+)hlsl"
+		R"hlsl(
+// Shadow darkness samples (see shadow_finish). The mask's coverage around q (3 x 3 at 2 px steps): G range, R max.
+void mask_around(int2 q, out float gmin, out float gmax, out float rmax)
+{
+	gmin = 1.0; gmax = 0.0; rmax = 0.0;
+	const int2 hi = int2(full_size) - 1;
+	[unroll] for (int y = -1; y <= 1; ++y)
+	[unroll] for (int x = -1; x <= 1; ++x)
+	{
+		const float4 m = char_mask.Load(int3(clamp(q + int2(x, y) * 2, int2(0, 0), hi), 0));
+		gmin = min(gmin, m.g);
+		gmax = max(gmax, m.g);
+		rmax = max(rmax, m.r);
+	}
+}
+// q in this frame, q + v_cam the same world point last frame. The shadow stays put on screen with the character, so
+// this frame's mask stands for last frame's too. One end well inside the shadow (flat coverage, not a held shadow),
+// the other clear of it, neither near the character, both on ground / floor or both on objects.
+void shadow_sample(int2 q, float2 v_cam, float g_now)
+{
+	const float2 pp = float2(q) + v_cam;
+	if (any(pp < 1.0) || any(pp > float2(full_size) - 2.0)) return;
+	const int2 qp = int2(round(pp));
+	const float g_then = char_mask.Load(int3(qp, 0)).g;
+	const bool trailing = g_now < 0.004 && g_then >= 0.25; // left the shadow: inside it last frame
+	const bool leading = g_then < 0.004 && g_now >= 0.25;  // entered it
+	[branch] if (!trailing && !leading) return;
+	const int2 qi = trailing ? qp : q, qo = trailing ? q : qp;
+	const float4 ci = char_mask.Load(int3(qi, 0));
+	if (ci.a < 0.6 * ci.g) return; // a held shadow: its place is only estimated
+	float imin, imax, ir, omin, omax, orr;
+	mask_around(qi, imin, imax, ir);
+	mask_around(qo, omin, omax, orr);
+	if (imax - imin > 0.08 || omax > 0.004 || ir > 0.004 || orr > 0.004) return;
+	uint cls = ci.b > 0.5 * ci.g ? 1u : 0u;
+	if (layers_valid())
+	{
+		const float li = entity_mask[qi / 2], lo = entity_mask[qo / 2];
+		const bool obj_i = li >= LAYER_OBJECT - 0.01, obj_o = lo >= LAYER_OBJECT - 0.01;
+		if (obj_i != obj_o || li >= LAYER_ICON - 0.01 || lo >= LAYER_ICON - 0.01) return;
+		if (obj_i) cls += 2u;
+	}
+	const float l_now = luma_full[q], l_then = bl_full_prev(pp);
+	const float l_in = trailing ? l_then : l_now, l_out = trailing ? l_now : l_then;
+	if (l_out < 0.05) return;
+	const float r = l_in / l_out;
+	if (r > 1.03 || r < 0.05) return;
+	const float c = trailing ? g_then : g_now;
+	const float k = saturate((1.0 - r) / c);
+	uint dummy;
+	InterlockedAdd(stats[SH_HIST + cls * SH_BINS + min(uint(k * float(SH_BINS)), uint(SH_BINS - 1))], uint(c * 16.0 + 0.5), dummy);
+	InterlockedAdd(stats[SH_COUNT + cls], 1, dummy);
+}
 // One thread per half-res pixel, writes 2 x 2 full-res pixels. Near block borders, each pixel picks the motion of
 // its own block or a neighbouring block, whichever matches locally: object outlines get 2 px precision.
 [numthreads(8, 8, 1)]
@@ -1124,8 +1286,11 @@ void cs_expand(uint3 id : SV_DispatchThreadID)
 		differs = differs || any(abs(cands[i] - own) > 0.75);
 	// Alt-mode icon pixel: the camera when its block is camera, or when the camera matches it at least as well as the
 	// block's own motion (a static icon in a block taken over by a passing train or robot).
+	// Beta 36: always - rows of identical module icons match a shift by one icon (or a neighbouring block's vector)
+	// about as well as the camera, and running sideways along a row picked that (blurred modules). Icons sit on
+	// buildings; nothing they mark moves.
 	const bool icon_here = layers_valid() && is_icon(entity_mask[p]);
-	if (icon_here && !use_camera && pixel_sad(p, int2(round(cam))) <= pixel_sad(p, int2(round(own))) * 1.1)
+	if (icon_here && !use_camera)
 	{
 		use_camera = true;
 		own = cam;
@@ -1167,7 +1332,7 @@ void cs_expand(uint3 id : SV_DispatchThreadID)
 	// (bare ground itself always votes for the camera).
 	// Alt-mode icon pixels too: the air split puts whatever is drawn early in the air stage there, and the flying
 	// character is (it was never held in flight, and got the camera motion icons get). Real icons vote for the camera.
-	[branch] if (in_still_zone(float2(p)) &&
+	[branch] if (!exact_mask() && in_still_zone(float2(p)) &&
 		any(abs(cam) >= 1.0))
 	{
 		float l_zero = luma_sad5(p, int2(0, 0));
@@ -1214,8 +1379,33 @@ void cs_expand(uint3 id : SV_DispatchThreadID)
 	}
 
 	// Bare ground pixel: the camera, whatever the block decided (exact edges around the player, revealed ground).
-	if (layers_valid() && entity_mask[p] == 0 && !hold)
+	// Floor too (flag 262144, 1.2): belts, rails, pipes, grass and decoratives do not move on their own; an empty belt's
+	// scrolling surface repeats and drew wrong motion (stuck, blurred lanes). Items on belts then cross-fade (they move
+	// a pixel or two per frame). Their depth becomes the ground's: grass that flickers between ground and floor in the
+	// layer split no longer flickers in depth either.
+	const bool floor_cam = (flags & 262144) != 0;
+	const float layer_here = layers_valid() ? entity_mask[p] : -1.0;
+	if (layers_valid() && layer_here == 0 && !hold)
 		use_camera = true;
+	// Beta 35: a floor pixel keeps its own block's motion where that is certain - the block passed the repeat test in
+	// cs_block (or is not mostly floor), the motion is belt-like (at most 6 half-res px from the camera), and this pixel
+	// matches it clearly better than the camera. Items and the surface of a belt move together, so a belt whose motion
+	// is unambiguous slides (no stepping at 4x); repeating surfaces, a neighbouring belt's vector, and the other belt of
+	// a block over two belts take the camera.
+	if (floor_cam && layers_valid() && layer_here > 0.0 && layer_here < LAYER_OBJECT - 0.01 && !hold)
+	{
+		const float2 ob = block_smooth[b.y * blocks.x + b.x];
+		bool keep = false;
+		[branch] if (!is_camera(ob) && kind_of(ob) == 2)
+		{
+			const float2 rel = ob - cam;
+			[branch] if (max(abs(rel.x), abs(rel.y)) <= 6.0)
+				keep = pixel_sad(p, int2(round(ob))) < 0.7 * pixel_sad(p, int2(round(cam))) - 0.01;
+		}
+		use_camera = !keep;
+		if (keep)
+			mv = ob;
+	}
 	// Character painted over (flag 32768): frame generation gets what is under it there - the world, moving with the
 	// camera - and the character comes from the UI layer. So the camera's motion and the ground's depth: the world
 	// behind the character is interpolated like the rest of it (no noise where it is uncovered).
@@ -1230,23 +1420,87 @@ void cs_expand(uint3 id : SV_DispatchThreadID)
 	// ground far, floor (belts, shadows), objects, alt-mode icons, flying (bots) nearest
 	const float layer = layers_valid() ? entity_mask[p] : 0.0;
 	float depth = layer >= LAYER_AIR ? 0.1 : (is_icon(layer) ? 0.15 : (layer >= LAYER_OBJECT ? DEPTH_NEAR :
-		(layer > 0.0 ? 0.5 * (DEPTH_NEAR + DEPTH_FAR) : DEPTH_FAR)));
+		(layer > 0.0 && !floor_cam ? 0.5 * (DEPTH_NEAR + DEPTH_FAR) : DEPTH_FAR)));
 	// FSR: the same order, spread far apart once FSR turns depth into distances (near 0.1, far 100: ground ~50,
 	// floor ~1, objects ~0.2, flying ~0.13), so it never pulls the character into the ground around it.
 	if (flags & 16384)
-		depth = layer >= LAYER_AIR ? 0.2 : (is_icon(layer) ? 0.4 : (layer >= LAYER_OBJECT ? 0.5 : (layer > 0.0 ? 0.9 : 0.999)));
+		depth = layer >= LAYER_AIR ? 0.2 : (is_icon(layer) ? 0.4 : (layer >= LAYER_OBJECT ? 0.5 : (layer > 0.0 && !floor_cam ? 0.9 : 0.999)));
 	if (as_ground)
 		depth = (flags & 16384) ? 0.999 : DEPTH_FAR;
 	uint2 f = id.xy * 2;
+	// The character's shadow as a darkening laid over (flag 131072: the UI layer is used) once its darkness is known.
+	// Darkness samples while the camera moves steadily (no zoom, a good camera match, last frame's image valid).
+	const bool shade_on = exact_mask() && (flags & 131072) != 0;
+	const bool shade_measure = exact_mask() && (flags & 2) != 0 && abs(mdl.x - 1.0) < 0.0005 && global_motion[0].z > 0.5 &&
+		length(global_motion[0].xy) >= 0.75;
 	[unroll] for (uint y = 0; y < 2; ++y)
 	[unroll] for (uint x = 0; x < 2; ++x)
 	{
 		uint2 q = f + uint2(x, y);
 		// half-res -> full-res pixels; the camera exactly at this full-res pixel
-		float2 v = use_camera ? (mdl.x - 1.0) * (float2(q) - mdl.yz) + t_full : mv * 2.0;
+		const float2 v_cam = (mdl.x - 1.0) * (float2(q) - mdl.yz) + t_full;
+		float2 v = use_camera ? v_cam : mv * 2.0;
+		float d = depth;
+		float hv = hold ? (mask_here >= LAYER_ICON - 0.01 ? 0.5 : (mask_here >= LAYER_OBJECT - 0.01 ? 1.0 : 0.8)) : 0.0;
+		[branch] if (exact_mask() && all(q < full_size))
+		{
+			// Hold values: 1 the character on the ground, 0.5 flying (both laid over or painted over when asked), 0.8 its
+			// shadow held as it is (darkness not known yet, or the shadow's place only estimated), below 0.25 the shadow's
+			// darkening / 4 (laid over as a darkening; what is under it moves with the camera). The character's outline
+			// from 2 % coverage: its anti-aliased edge comes from the real frame too.
+			const float4 cm = char_mask.Load(int3(q, 0));
+			const bool is_char = cm.r > 0.02, in_shadow = !is_char && cm.g > 0.004;
+			[branch] if (shade_measure && !is_char)
+				shadow_sample(int2(q), v_cam, cm.g);
+			hv = is_char ? (cm.b > 0.2 ? 0.5 : 1.0) : 0.0;
+			const bool still_px = !use_camera && all(abs(mv) < 0.25);
+			// the shadow's darkness here: -1 unknown (or a held shadow), 0 not darkened (icons, flying things: drawn after)
+			float sk = -1.0;
+			[branch] if (in_shadow && shade_on && cm.a >= 0.6 * cm.g)
+			{
+				const uint fly = cm.b > 0.5 * cm.g ? 1u : 0u;
+				if (layers_valid() && mask_here >= LAYER_ICON - 0.01)
+					sk = 0.0;
+				else if (layers_valid() && mask_here >= LAYER_OBJECT - 0.01)
+				{
+					sk = shadow_k(2u + fly);
+					if (sk >= 0.0 && sk < 0.1) sk = 0.0; // objects are not darkened (noise of the measurement)
+				}
+				else
+				{
+					sk = shadow_k(fly);
+					if (sk < 0.0) sk = shadow_k(1u - fly); // walking and flying shadows: the same blend so far
+				}
+			}
+			if (is_char && (flags & 32768) != 0 && layers_valid())
+			{
+				v = v_cam;
+				d = (flags & 16384) ? 0.999 : DEPTH_FAR;
+			}
+			else if (is_char)
+			{
+				v = float2(0, 0);
+				d = cm.b > 0.2 ? ((flags & 16384) ? 0.2 : 0.1) : ((flags & 16384) ? 0.5 : DEPTH_NEAR);
+			}
+			else if (in_shadow && sk > 0.02)
+			{
+				// still there = the camera (the block search may have taken the shadow for something staying put),
+				// own motion kept (belt items)
+				hv = 0.25 * min(sk * cm.g, 0.9);
+				if (still_px)
+					v = v_cam;
+			}
+			else if (in_shadow && sk < 0.0 && cm.g > 0.2)
+			{
+				v = float2(0, 0);
+				hv = 0.8;
+			}
+			else if (still_px && any(abs(cam) >= 1.0))
+				v = v_cam; // "stays put" outside the character: only the character does (a block mostly covering it)
+		}
 		if (flags & 1) v = -v;
 		if ((flags & 2) == 0) v = float2(0, 0);
-		if (all(q < full_size)) { mvec[q] = v; depth_out[q] = depth; hold_out[q] = hold ? (mask_here >= LAYER_ICON - 0.01 ? 0.5 : (mask_here >= LAYER_OBJECT - 0.01 ? 1.0 : 0.8)) : 0.0; }
+		if (all(q < full_size)) { mvec[q] = v; depth_out[q] = d; hold_out[q] = hv; }
 	}
 }
 
@@ -1318,11 +1572,12 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 		float still_zone;
 	};
 	constexpr UINT CONSTANT_COUNT = sizeof(constants) / 4;
-	constexpr UINT TABLE_SIZE = 31; // t0, u0..u23, t1..t6 (world layers)
+	constexpr UINT TABLE_SIZE = 32; // t0, u0..u23, t1..t6 (world layers), t7 (exact character mask)
 	constexpr UINT UAV_COUNT = 24;
 	constexpr UINT LAYER_SLOT = 1 + UAV_COUNT; // t1 ground, t2 entities, t3 floor, t4 post-cloud, t5 world, from this slot
 	constexpr UINT LAYER_COUNT = 6;
-	constexpr UINT STATS_BYTES = 32;  // uint[3] blocks per kind, searched, wide-searched, movers found (+ padding)
+	constexpr UINT CHAR_SLOT = LAYER_SLOT + LAYER_COUNT; // t7 exact character mask
+	constexpr UINT STATS_BYTES = 640; // uint[3] blocks per kind, searched, wide-searched, movers found; [8..159] shadow darkness (SH_*)
 	constexpr UINT COARSE_N = 33, ZOOM_SCALES = 25, ZOOM_T = 7, ZOOM_VARIANTS = 5, FINE_N = 7, REFINE_N = 7;
 	constexpr UINT SAD_COUNT = 2 * COARSE_N * COARSE_N + 2 * ZOOM_SCALES * ZOOM_T * ZOOM_T + ZOOM_VARIANTS * FINE_N * FINE_N + ZOOM_VARIANTS * REFINE_N * REFINE_N;
 	constexpr UINT GLOBAL_ENTRIES = 8; // float4 each
@@ -1350,6 +1605,8 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 		ID3D12Resource *stats = nullptr, *debug = nullptr, *depth = nullptr, *block_alt = nullptr; // block_alt: block_pre (u19)
 		ID3D12Resource *mover_out = nullptr;
 		uint32_t searched = 0, wide_searched = 0, movers = 0; // blocks, from the stats (two frames late)
+		motion::shadow_info shadow = {};                              // shadow darkness per class (stats, two frames late)
+		bool shadow_overlay = false;                          // the shadow is laid over as a darkening (when measured)
 		bool debug_written = false;
 		float share_camera = 0, share_still = 0, share_own = 0; // block shares, a few frames old
 		ID3D12Resource *readback[3] = {};
@@ -1362,6 +1619,8 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 
 		uint32_t w = 0, h = 0, half_w = 0, half_h = 0, quarter_w = 0, quarter_h = 0, eighth_w = 0, eighth_h = 0, blocks_x = 0, blocks_y = 0;
 		ID3D12Resource *bound_hudless = nullptr; // not owned
+		ID3D12Resource *bound_char = nullptr;    // not owned
+		bool exact_used = false;                 // the last frame used the exact character mask
 		ID3D12Resource *bound_layers[LAYER_COUNT] = {}; // not owned
 		ID3D12Resource *entity_mask = nullptr;
 		bool layers_used = false;
@@ -1470,6 +1729,21 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 		m->bound_hudless = hudless;
 	}
 
+	// The exact character mask (R8G8B8A8_UNORM); null writes a null descriptor (reads 0).
+	void write_char_srv(ID3D12Resource *res)
+	{
+		for (UINT table = 0; table < 2; ++table)
+		{
+			D3D12_SHADER_RESOURCE_VIEW_DESC d = {};
+			d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			d.Texture2D.MipLevels = 1;
+			m->dev->CreateShaderResourceView(res, &d, cpu_slot(table, CHAR_SLOT));
+		}
+		m->bound_char = res;
+	}
+
 	void write_layer_srvs(ID3D12Resource *const *res)
 	{
 		for (UINT table = 0; table < 2; ++table)
@@ -1506,6 +1780,7 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 		release(m->block_alt);
 		release(m->mover_out);
 		m->bound_hudless = nullptr;
+		m->bound_char = nullptr;
 		for (auto &l : m->bound_layers)
 			l = nullptr;
 		release(m->entity_mask);
@@ -1584,6 +1859,7 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 			write_texture_uav(p, 23, m->hold, DXGI_FORMAT_R8_UNORM);
 			write_texture_uav(p, 24, m->still_score, DXGI_FORMAT_R32_FLOAT);
 		}
+		write_char_srv(nullptr);
 		m->history = 0;
 		return true;
 	}
@@ -1806,7 +2082,11 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 		start_compile();
 
 		// Root signature: constants (b0) + one table {t0, u0..u13}.
-		D3D12_DESCRIPTOR_RANGE ranges[3] = {};
+		D3D12_DESCRIPTOR_RANGE ranges[4] = {};
+		ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		ranges[3].NumDescriptors = 1;
+		ranges[3].BaseShaderRegister = 7;
+		ranges[3].OffsetInDescriptorsFromTableStart = CHAR_SLOT;
 		ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		ranges[2].NumDescriptors = LAYER_COUNT;
 		ranges[2].BaseShaderRegister = 1;
@@ -1825,7 +2105,7 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 		params[0].Constants.Num32BitValues = CONSTANT_COUNT;
 		params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		params[1].DescriptorTable.NumDescriptorRanges = 3;
+		params[1].DescriptorTable.NumDescriptorRanges = 4;
 		params[1].DescriptorTable.pDescriptorRanges = ranges;
 		params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		D3D12_ROOT_SIGNATURE_DESC rs = {};
@@ -1994,6 +2274,10 @@ namespace motion
 			write_hudless_srv(hudless);
 			m->history = 0;
 		}
+		ID3D12Resource *const charm = layer_in.character;
+		if (charm != nullptr && charm != m->bound_char)
+			write_char_srv(charm);
+		m->exact_used = charm != nullptr;
 
 		const UINT parity = static_cast<UINT>(m->frame & 1);
 		constants c = {};
@@ -2011,7 +2295,10 @@ namespace motion
 			| (options.icons_first ? 4096u : 0u)
 			| (options.wide_search ? 8192u : 0u)
 			| (options.spread_depth ? 16384u : 0u)
-			| (options.hold_as_ground ? 32768u : 0u);
+			| (options.hold_as_ground ? 32768u : 0u)
+			| (charm != nullptr ? 65536u : 0u)
+			| (charm != nullptr && options.shadow_overlay ? 131072u : 0u)
+			| (options.floor_camera ? 262144u : 0u);
 		// SAD units: sum over 64 half-res pixels of |luma difference| (each 0..1)
 		c.penalty_zero = options.penalty_zero;
 		c.penalty_other = options.penalty_zero * 1.4f;
@@ -2055,6 +2342,8 @@ namespace motion
 				for (ID3D12Resource *r : res)
 					transition(l, r, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 			}
+			if (charm != nullptr)
+				transition(l, charm, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 		};
 		// Inputs back to COMMON (shared with D3D11, and the state the caller expects).
 		auto end_inputs = [&](ID3D12GraphicsCommandList *l) {
@@ -2064,6 +2353,8 @@ namespace motion
 				for (ID3D12Resource *r : res)
 					transition(l, r, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 			}
+			if (charm != nullptr)
+				transition(l, charm, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 		};
 		begin_list(list);
 
@@ -2167,8 +2458,18 @@ namespace motion
 		transition(list, m->stats, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
 		list->CopyBufferRegion(m->readback[slot], GLOBAL_ENTRIES * 16, m->stats, 0, STATS_BYTES);
 		{
-			uint32_t counts[6];
+			uint32_t counts[24];
 			std::memcpy(counts, static_cast<const char *>(m->readback_ptr[(slot + 1) % 3]) + GLOBAL_ENTRIES * 16, sizeof(counts));
+			if (m->frame >= 3)
+			{
+				for (int k = 0; k < 4; ++k)
+				{
+					std::memcpy(&m->shadow.k[k], &counts[8 + k], sizeof(float));
+					m->shadow.frames[k] = counts[12 + k];
+					m->shadow.samples[k] = counts[16 + k];
+				}
+			}
+			m->shadow_overlay = charm != nullptr && options.shadow_overlay;
 			if (m->frame >= 3)
 			{
 				m->searched = counts[3];
@@ -2260,6 +2561,18 @@ namespace motion
 	bool layers_used()
 	{
 		return m != nullptr && m->layers_used;
+	}
+
+	bool shadow_darkness(shadow_info &out)
+	{
+		out = m != nullptr ? m->shadow : shadow_info{};
+		const bool known = out.frames[0] >= 3 || out.frames[1] >= 3;
+		return m != nullptr && m->shadow_overlay && m->exact_used && known;
+	}
+
+	bool exact_mask_used()
+	{
+		return m != nullptr && m->exact_used;
 	}
 
 	ID3D12Resource *hold_texture()

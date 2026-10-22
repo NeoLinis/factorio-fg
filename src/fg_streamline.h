@@ -49,6 +49,7 @@ namespace fg_sl
 	void end();
 
 	const char *status();
+	bool ui_supported(); // false once DLSS-G refused UI recomposition (no UI layer from then on)
 	// Frames shown per Factorio frame at the last state poll (1 = no generated frames), 0 if unknown.
 	uint32_t frames_per_present();
 	const char *depth_status(); // which depth was tagged and whether Streamline accepted it

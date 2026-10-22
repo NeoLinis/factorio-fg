@@ -24,6 +24,7 @@ namespace
 	D3D12_RESOURCE_STATES g_ui_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 	D3D12_RESOURCE_STATES g_clean_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 	bool g_inpainted = false;
+	bool g_clean_written = false; // the clean frame was written (painted over and / or the shadow taken out)
 
 	// the resources the descriptors were written for
 	ID3D12Resource *g_d_final = nullptr, *g_d_hudless = nullptr, *g_d_hold = nullptr, *g_d_floor = nullptr, *g_d_objects = nullptr;
@@ -62,13 +63,17 @@ namespace
 	const char UI_SHADER[] = R"hlsl(
 Texture2D<float4> final_frame : register(t0);
 Texture2D<float4> hudless : register(t1);
-Texture2D<float> hold : register(t2); // character pixels held still (motion pass); shown from the real frame
+// Character pixels held still (motion pass), shown from the real frame: 1 on the ground, 0.5 flying, 0.8 its shadow as
+// it is. Below 0.25: the shadow laid over as a darkening (value x 4), the ground under it moving with the camera.
+Texture2D<float> hold : register(t2);
 Texture2D<float4> floor_snap : register(t3); // world snapshot after the floor stage: the ground under the character
 Texture2D<float4> objects_snap : register(t4); // world snapshot with all objects, before the flying stage: under it in flight
 RWTexture2D<unorm float4> ui : register(u0);
 RWStructuredBuffer<uint> ui_count : register(u1);
 RWTexture2D<unorm float4> clean : register(u2); // the frame generation blends, with the character painted over
-cbuffer constants : register(b0) { uint2 size; float threshold; uint hold_on; uint inpaint_on; };
+// hold_char: lay the character over (else only its shadow's darkening); grow: px the character's hold is grown by;
+// clean_on: write the clean frame (painted over and / or the shadow taken out)
+cbuffer constants : register(b0) { uint2 size; float threshold; uint hold_on; uint inpaint_on; uint hold_char; uint grow; uint clean_on; };
 groupshared uint group_count;
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
@@ -82,15 +87,26 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 		float3 d = abs(f - h);
 		bool is_ui = max(d.r, max(d.g, d.b)) > threshold;
 		bool held = false;
-		float hold_max = 0.0;
+		float hold_max = 0.0, shade = 0.0;
 		int2 hi = int2(size) - 1;
 		if (hold_on != 0)
 		{
-			// held character, grown by two pixels (its anti-aliased outline, single missed pixels inside)
-			[unroll] for (int y = -2; y <= 2; ++y)
-			[unroll] for (int x = -2; x <= 2; ++x)
-				hold_max = max(hold_max, hold.Load(int3(clamp(int2(id.xy) + int2(x, y), int2(0, 0), hi), 0)));
-			held = hold_max > 0.25;
+			// held character, grown by 'grow' pixels (its anti-aliased outline, single missed pixels inside: 2 for
+			// the guessed hold, 1 for the exact mask)
+			if (hold_char != 0)
+			{
+				[unroll] for (int y = -2; y <= 2; ++y)
+				[unroll] for (int x = -2; x <= 2; ++x)
+				{
+					const float v = hold.Load(int3(clamp(int2(id.xy) + int2(x, y), int2(0, 0), hi), 0));
+					if (max(abs(x), abs(y)) <= int(grow) && v > 0.25)
+						hold_max = max(hold_max, v);
+				}
+				held = hold_max > 0.25;
+			}
+			const float own = hold.Load(int3(id.xy, 0));
+			if (own > 0.001 && own < 0.249)
+				shade = min(own * 4.0, 0.9);
 		}
 		is_ui = is_ui || held;
 		// painted over: a wider area (4 px around the hold), so no rim of the character stays in what frame generation
@@ -109,9 +125,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 			}
 		}
 		const bool paint = paint_ground || paint_flying;
-		ui[id.xy] = is_ui ? float4(f, 1.0) : float4(0.0, 0.0, 0.0, 0.0);
+		// The shadow: black at its darkness over the generated frame (stays put with the character); the frame
+		// generation input has the ground there without it (below).
+		ui[id.xy] = is_ui ? float4(f, 1.0) : float4(0.0, 0.0, 0.0, shade);
 		if (is_ui) InterlockedAdd(group_count, 1);
-		if (inpaint_on != 0)
+		if (clean_on != 0)
 		{
 			// The character removed from what frame generation blends: what is under it from a world snapshot taken before it
 			// is drawn (on the ground: the floor snapshot, ground and shadows; flying: the objects snapshot, trees and
@@ -136,6 +154,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 					ratio = clamp(sum_h / max(sum_f, float3(0.01, 0.01, 0.01)), 0.0, 4.0);
 				c = saturate((flying ? objects_snap[id.xy].rgb : floor_snap[id.xy].rgb) * ratio);
 			}
+			// The shadow taken out: the ground as it is without it (the darkening comes back with the UI layer, so
+			// FSR's real frames, composed the same way, stay as Factorio drew them).
+			if (shade > 0.0)
+				c = saturate(c / (1.0 - shade));
 			clean[id.xy] = float4(c, 1.0);
 		}
 	}
@@ -218,7 +240,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 		ranges[2].OffsetInDescriptorsFromTableStart = 6;
 		D3D12_ROOT_PARAMETER params[3] = {};
 		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-		params[0].Constants.Num32BitValues = 5;
+		params[0].Constants.Num32BitValues = 8;
 		params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 		params[1].DescriptorTable.NumDescriptorRanges = 3;
@@ -321,6 +343,7 @@ namespace ui_layer
 		g_device = nullptr;
 		g_failed = false;
 		g_inpainted = false;
+		g_clean_written = false;
 		g_coverage = -1.0f;
 	}
 
@@ -331,10 +354,13 @@ namespace ui_layer
 			return false;
 		ID3D12Resource *const hold = in.hold;
 		// painting the character over needs it held and both snapshots
-		const bool inpaint = in.inpaint && hold != nullptr && in.floor != nullptr && in.objects != nullptr;
+		const bool inpaint = in.inpaint && in.hold_character && hold != nullptr && in.floor != nullptr && in.objects != nullptr;
+		// the clean frame: painted over, and / or the shadow taken out
+		const bool write_clean = inpaint || (in.shadow && hold != nullptr);
 		ID3D12Resource *const floor = inpaint ? in.floor : nullptr;
 		ID3D12Resource *const objects = inpaint ? in.objects : nullptr;
 		g_inpainted = inpaint;
+		g_clean_written = write_clean;
 
 		const UINT inc = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 		if (!g_descriptors || in.final_frame != g_d_final || in.hudless != g_d_hudless || hold != g_d_hold || floor != g_d_floor || objects != g_d_objects)
@@ -393,9 +419,9 @@ namespace ui_layer
 			barrier(b[n++], floor, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 			barrier(b[n++], objects, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 		}
-		if (inpaint && g_clean_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+		if (write_clean && g_clean_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
 			barrier(b[n++], g_clean, g_clean_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-		if (inpaint)
+		if (write_clean)
 			g_clean_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 		if (hold != nullptr)
 			barrier(b[n++], hold, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -410,9 +436,9 @@ namespace ui_layer
 		list->SetDescriptorHeaps(1, heaps);
 		list->SetComputeRootSignature(g_root);
 		list->SetPipelineState(g_pso);
-		struct { uint32_t w, h; float threshold; uint32_t hold_on, inpaint_on; } c = { g_width, g_height, 1.5f / 255.0f, hold != nullptr ? 1u : 0u,
-			inpaint ? 1u : 0u };
-		list->SetComputeRoot32BitConstants(0, 5, &c, 0);
+		struct { uint32_t w, h; float threshold; uint32_t hold_on, inpaint_on, hold_char, grow, clean_on; } c = { g_width, g_height, 1.5f / 255.0f,
+			hold != nullptr ? 1u : 0u, inpaint ? 1u : 0u, in.hold_character ? 1u : 0u, in.exact ? 1u : 2u, write_clean ? 1u : 0u };
+		list->SetComputeRoot32BitConstants(0, 8, &c, 0);
 		list->SetComputeRootDescriptorTable(1, g_heap->GetGPUDescriptorHandleForHeapStart());
 		list->SetComputeRootUnorderedAccessView(2, g_count->GetGPUVirtualAddress());
 		list->Dispatch((g_width + 7) / 8, (g_height + 7) / 8, 1);
@@ -426,7 +452,7 @@ namespace ui_layer
 			barrier(b[n++], floor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 			barrier(b[n++], objects, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 		}
-		if (inpaint)
+		if (write_clean)
 		{
 			barrier(b[n++], g_clean, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, CLEAN_READ);
 			g_clean_state = CLEAN_READ;
@@ -453,7 +479,7 @@ namespace ui_layer
 
 	ID3D12Resource *clean_texture()
 	{
-		return g_inpainted ? g_clean : nullptr;
+		return g_clean_written ? g_clean : nullptr;
 	}
 
 	D3D12_RESOURCE_STATES clean_state()

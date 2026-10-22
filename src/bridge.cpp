@@ -67,14 +67,15 @@ namespace
 		com<ID3D12Fence> frame_fence;
 		uint64_t frame_fence_value = 0;
 		HANDLE frame_event = nullptr;
+		HANDLE cut_event = nullptr; // the scene-cut wait's own (it may be signalled after its short wait gave up)
 		com<ID3D12Fence> shared_fence12;
 		uint64_t shared_value = 0;
 
 		com<IDXGISwapChain3> swapchain;
 		com<ID3D12Resource> back_buffers[BACK_BUFFERS];
 
-		com<ID3D12Resource> final12, hudless12;
-		com<ID3D11Texture2D> final11, hudless11;
+		com<ID3D12Resource> final12, hudless12, mask12;
+		com<ID3D11Texture2D> final11, hudless11, mask11; // mask: the exact character mask (always R8G8B8A8_UNORM)
 		// World layer snapshots, see bridge::layer. Two sets: the add-on copies this frame's snapshots straight into
 		// set 'layer_write' (no extra copy at present) while D3D12 may still read the other set from the last frame.
 		com<ID3D12Resource> layer12[2][bridge::LAYER_COUNT];
@@ -90,6 +91,11 @@ namespace
 		float last_diff = 0;
 		uint32_t cuts = 0;
 		float wait_ms = 0, cpu_ms = 0; // smoothed: GPU wait for the cut check, total CPU time in present()
+		float last_wait_ms = 0, last_cpu_ms = 0; // the last frame's
+		// scene-cut check not finished within the short wait: evaluated at the next frame (fence value, 0 = none)
+		uint64_t cut_pending = 0;
+		float last_alloc_wait_ms = 0, last_present_call_ms = 0; // the last frame: waiting for a free command allocator, inside Present
+		uint32_t cuts_late = 0, checks_late = 0;
 	};
 
 	state *s = nullptr;
@@ -250,6 +256,7 @@ namespace
 			b.reset();
 		s->final11.reset(); s->final12.reset();
 		s->hudless11.reset(); s->hudless12.reset();
+		s->mask11.reset(); s->mask12.reset();
 		++g_layer_generation; // pointers handed out by layer_target() are about to go
 		for (uint32_t k = 0; k < 2; ++k)
 			for (uint32_t i = 0; i < bridge::LAYER_COUNT; ++i)
@@ -307,6 +314,11 @@ namespace
 		if (!create_shared_texture(w, h, s->format, s->final12, s->final11) ||
 			!create_shared_texture(w, h, s->format, s->hudless12, s->hudless11))
 			return false;
+		if (!create_shared_texture(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, s->mask12, s->mask11))
+		{
+			s->mask11.reset(); // optional: without it the character is guessed as in 1.1
+			s->mask12.reset();
+		}
 		for (uint32_t k = 0; k < 2; ++k)
 			for (uint32_t i = 0; i < bridge::LAYER_COUNT; ++i)
 				if (!create_shared_texture(w, h, s->format, s->layer12[k][i], s->layer11[k][i]))
@@ -402,6 +414,7 @@ namespace
 		if (FAILED(s->dev12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(s->frame_fence.put()))))
 			return false;
 		s->frame_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+		s->cut_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
 		// Fence shared with D3D11
 		if (FAILED(s->dev12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(s->shared_fence12.put()))))
@@ -530,6 +543,8 @@ namespace bridge
 		}
 		if (s->frame_event != nullptr)
 			CloseHandle(s->frame_event);
+		if (s->cut_event != nullptr)
+			CloseHandle(s->cut_event);
 
 		++g_layer_generation;
 		delete s; // com<> members release in reverse declaration order
@@ -655,6 +670,12 @@ namespace bridge
 		motion::search_counts(t.blocks_searched, t.blocks_wide, t.movers_found);
 		t.cut_wait_ms = s->wait_ms;
 		t.present_cpu_ms = s->cpu_ms;
+		t.last_cut_wait_ms = s->last_wait_ms;
+		t.cut_checks_late = s->checks_late;
+		t.last_alloc_wait_ms = s->last_alloc_wait_ms;
+		t.last_present_call_ms = s->last_present_call_ms;
+		t.cuts_late = s->cuts_late;
+		t.last_present_cpu_ms = s->last_cpu_ms;
 		t.difference = s->last_diff;
 		t.difference_average = s->diff_average;
 		t.scene_cuts = s->cuts;
@@ -679,8 +700,29 @@ namespace bridge
 		return g_layer_generation;
 	}
 
+	bool shadow_darkness(shadow_info &out)
+	{
+		out = {};
+		if (s == nullptr)
+			return false;
+		motion::shadow_info mi = {};
+		const bool used = motion::shadow_darkness(mi);
+		for (int i = 0; i < 4; ++i)
+		{
+			out.k[i] = mi.k[i];
+			out.frames[i] = mi.frames[i];
+			out.samples[i] = mi.samples[i];
+		}
+		return used;
+	}
+
+	bool exact_mask_used()
+	{
+		return s != nullptr && motion::exact_mask_used();
+	}
+
 	void present(ID3D11DeviceContext *context, ID3D11Texture2D *final_frame, ID3D11Texture2D *hudless,
-		ID3D11Texture2D *const *layers_in, uint64_t layers_generation, const present_options &options)
+		ID3D11Texture2D *const *layers_in, uint64_t layers_generation, ID3D11Texture2D *character_mask, const present_options &options)
 	{
 		if (s == nullptr || context == nullptr || final_frame == nullptr || g_suspended)
 			return;
@@ -718,6 +760,17 @@ namespace bridge
 		context->CopyResource(s->final11.get(), final_frame);
 		if (hudless != nullptr)
 			context->CopyResource(s->hudless11.get(), hudless);
+		bool have_mask = false;
+		if (character_mask != nullptr && s->mask11)
+		{
+			D3D11_TEXTURE2D_DESC md = {};
+			character_mask->GetDesc(&md);
+			if (md.Width == s->width && md.Height == s->height && md.Format == DXGI_FORMAT_R8G8B8A8_UNORM)
+			{
+				context->CopyResource(s->mask11.get(), character_mask);
+				have_mask = true;
+			}
+		}
 		// Snapshots taken straight into this frame's set need no copy; others (taken into the add-on's own textures)
 		// are copied in. Pointers from before a resize or restart are not touched.
 		const uint32_t set = s->layer_write;
@@ -735,6 +788,8 @@ namespace bridge
 
 		// ---- D3D12: wait for the copy, blit into the swap chain, present
 		const UINT index = s->swapchain->GetCurrentBackBufferIndex();
+		LARGE_INTEGER a0, a1;
+		QueryPerformanceCounter(&a0);
 		if (s->frame_fence->GetCompletedValue() < s->allocator_fence[index])
 		{
 			s->frame_fence->SetEventOnCompletion(s->allocator_fence[index], s->frame_event);
@@ -749,6 +804,8 @@ namespace bridge
 				return;
 			}
 		}
+		QueryPerformanceCounter(&a1);
+		s->last_alloc_wait_ms = static_cast<float>(static_cast<double>(a1.QuadPart - a0.QuadPart) * 1000.0 / static_cast<double>(t_freq.QuadPart));
 		s->allocators[index]->Reset();
 		s->list->Reset(s->allocators[index].get(), nullptr);
 
@@ -798,9 +855,12 @@ namespace bridge
 				ms.debug_layer_view = options.motion_debug_layer_view;
 				ms.icons_first = options.motion_icons_first;
 				ms.wide_search = options.motion_wide_search;
+				ms.floor_camera = options.motion_floor_camera;
 				ms.spread_depth = fg::current() == fg::backend::fsr;
 				ms.hold_as_ground = options.fg_hold_character && options.fg_inpaint_character && !options.fg_show_ui_layer &&
 					options.fg_multiplier > 1 && !options.motion_debug_view;
+				ms.shadow_overlay = options.fg_shadow_overlay && options.fg_multiplier > 1 && !options.motion_debug_view &&
+					fg::ui_layer_usable();
 				motion::layer_set ls;
 				if (layers)
 				{
@@ -811,7 +871,40 @@ namespace bridge
 					ls.world = s->layer12[set][LAYER_WORLD].get();
 					ls.airsplit = s->layer12[set][LAYER_AIRSPLIT].get();
 				}
+				ls.character = have_mask ? s->mask12.get() : nullptr;
 				const bool cut_check = options.scene_cut_detection && options.fg_multiplier > 1;
+				// The scene-cut metric of a frame (motion::current_difference: the frame recorded last). A cut found
+				// late (the check did not finish within the short wait at its own present) still clears the histories
+				// before this frame's motion is recorded: only the frames generated across the cut itself are lost.
+				const auto judge_cut = [&](bool late) {
+					float diff = 0;
+					if (!motion::current_difference(diff))
+						return;
+					s->last_diff = diff;
+					const bool cut = s->diff_samples >= 8 && diff > options.scene_cut_min_difference &&
+						diff > s->diff_average * options.scene_cut_factor;
+					if (cut)
+					{
+						++s->cuts;
+						if (late)
+							++s->cuts_late;
+						fg::reset_history();
+						motion::invalidate_history();
+						log_line("bridge: scene cut (difference %.3f, average %.3f)%s", diff, s->diff_average, late ? " - found a frame late" : "");
+					}
+					else
+					{
+						s->diff_average = s->diff_samples == 0 ? diff : s->diff_average * 0.9f + diff * 0.1f;
+						++s->diff_samples;
+					}
+				};
+				if (s->cut_pending != 0)
+				{
+					// a frame later the GPU is normally done; if not, waiting now would stall just the same: drop it
+					if (s->frame_fence->GetCompletedValue() >= s->cut_pending)
+						judge_cut(true);
+					s->cut_pending = 0;
+				}
 				cut_split split;
 				split.list = s->list.get();
 				split.queue = s->queue.get();
@@ -856,29 +949,25 @@ namespace bridge
 					bool done = s->frame_fence->GetCompletedValue() >= check;
 					if (!done)
 					{
-						s->frame_fence->SetEventOnCompletion(check, s->frame_event);
-						done = WaitForSingleObject(s->frame_event, 100) == WAIT_OBJECT_0;
+						// At most 2 ms: the GPU may still be busy with earlier frames (frame generation, its pacing), and
+						// waiting for that stalled Factorio's thread by 30-60 ms at times (stutter log, beta 32). Not done
+						// by then: judged at the next frame.
+						if (s->cut_event != nullptr)
+						{
+							ResetEvent(s->cut_event); // a late signal of an earlier check
+							s->frame_fence->SetEventOnCompletion(check, s->cut_event);
+							WaitForSingleObject(s->cut_event, 2);
+						}
+						done = s->frame_fence->GetCompletedValue() >= check;
 					}
 					QueryPerformanceCounter(&w1);
 					wait_ms = static_cast<float>(static_cast<double>(w1.QuadPart - w0.QuadPart) * 1000.0 / static_cast<double>(t_freq.QuadPart));
-					float diff = 0;
-					if (done && motion::current_difference(diff))
+					if (done)
+						judge_cut(false);
+					else
 					{
-						s->last_diff = diff;
-						const bool cut = s->diff_samples >= 8 && diff > options.scene_cut_min_difference &&
-							diff > s->diff_average * options.scene_cut_factor;
-						if (cut)
-						{
-							++s->cuts;
-							fg::reset_history();
-							motion::invalidate_history();
-							log_line("bridge: scene cut (difference %.3f, average %.3f)", diff, s->diff_average);
-						}
-						else
-						{
-							s->diff_average = s->diff_samples == 0 ? diff : s->diff_average * 0.9f + diff * 0.1f;
-							++s->diff_samples;
-						}
+						s->cut_pending = check;
+						++s->checks_late;
 					}
 				}
 			}
@@ -890,7 +979,10 @@ namespace bridge
 				ui_layer::inputs in;
 				in.final_frame = s->final12.get();
 				in.hudless = s->hudless12.get();
-				in.hold = options.fg_hold_character ? hold : nullptr;
+				in.hold = hold; // also when the character is generated: the shadow's darkening
+				in.hold_character = options.fg_hold_character;
+				in.exact = motion::exact_mask_used();
+				in.shadow = options.fg_shadow_overlay && motion::exact_mask_used();
 				in.floor = layers ? s->layer12[set][LAYER_FLOOR].get() : nullptr;
 				in.objects = layers ? s->layer12[set][LAYER_ENTITIES].get() : nullptr;
 				in.inpaint = options.fg_inpaint_character && !options.fg_show_ui_layer;
@@ -931,6 +1023,8 @@ namespace bridge
 		s->allocator_fence[index] = s->frame_fence_value;
 
 		const bool tear = options.allow_tearing && s->tearing_supported;
+		LARGE_INTEGER p0, p1;
+		QueryPerformanceCounter(&p0);
 		if (s->fg)
 			fg::present_start();
 		HRESULT hr = s->swapchain->Present(tear ? 0 : 1, tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
@@ -943,6 +1037,8 @@ namespace bridge
 		}
 		if (s->fg)
 			fg::present_end();
+		QueryPerformanceCounter(&p1);
+		s->last_present_call_ms = static_cast<float>(static_cast<double>(p1.QuadPart - p0.QuadPart) * 1000.0 / static_cast<double>(t_freq.QuadPart));
 		if (signal_late)
 			s->queue->Signal(s->shared_fence12.get(), ++s->shared_value);
 		if (FAILED(hr))
@@ -958,6 +1054,8 @@ namespace bridge
 		const float cpu_ms = static_cast<float>(static_cast<double>(t_end.QuadPart - t_start.QuadPart) * 1000.0 / static_cast<double>(t_freq.QuadPart));
 		s->cpu_ms = s->cpu_ms * 0.9f + cpu_ms * 0.1f;
 		s->wait_ms = s->wait_ms * 0.9f + wait_ms * 0.1f;
+		s->last_cpu_ms = cpu_ms;
+		s->last_wait_ms = wait_ms;
 		set_status("active, %ux%u, %llu frames, %s", s->width, s->height, static_cast<unsigned long long>(s->frames),
 			tear ? "tearing/VRR" : "vsync");
 	}

@@ -38,7 +38,15 @@ add_library(hudless_probe SHARED
   src/version.h
   src/version.rc
   src/setup_check.cpp
-  src/setup_check.h)
+  src/setup_check.h
+  src/sprite_probe.cpp
+  src/sprite_probe.h
+  src/sprite_mask.cpp
+  src/sprite_mask.h
+  src/steam_overlay.cpp
+  src/steam_overlay.h
+  src/stutter.cpp
+  src/stutter.h)
 target_include_directories(hudless_probe PRIVATE "${RESHADE_DIR}/include" "${IMGUI_DIR}" "${STREAMLINE_DIR}/include"
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fidelityfx/api/include" "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fidelityfx/framegeneration/include")
 target_compile_definitions(hudless_probe PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)

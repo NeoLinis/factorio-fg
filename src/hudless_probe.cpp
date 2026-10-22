@@ -27,12 +27,17 @@
 #include "fg.h"
 #include "version.h"
 #include "setup_check.h"
+#include "sprite_probe.h"
+#include "sprite_mask.h"
+#include "steam_overlay.h"
+#include "stutter.h"
 #include <algorithm>
 #include <cinttypes>
 #include <cstdarg>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <filesystem>
 #include <mutex> // std::lock_guard only
 #include <string>
@@ -76,6 +81,8 @@ namespace
 	app_mutex g_mutex;
 	device *g_device = nullptr; // the one D3D11 device we follow; events from any other device are ignored
 	bool g_config_loaded = false;
+
+	void sprite_log(const char *message) { reshade::log::message(reshade::log::level::info, message); }
 
 	void log_info(const char *fmt, ...)
 	{
@@ -169,6 +176,7 @@ namespace
 	uint32_t g_air_split_ps = DEFAULT_AIR_SPLIT_PS;
 	bool g_air_icons_first = true;     // icons are drawn before the split
 	bool g_wide_search = true;         // wide mover search (fast trains)
+	bool g_floor_camera = true;        // 1.2: belts and other floor move with the world
 	// pixel shaders drawn on the world target in the air stage, with counts: this frame (building) and last frame
 	struct air_draw { uint32_t ps; int count; };
 	constexpr int AIR_DRAW_SLOTS = 12;
@@ -303,6 +311,18 @@ namespace
 	bool g_fsr_ui_layer = false;   // FSR: show the extracted GUI layer; not saved
 	bool g_fsr_only_generated = false; // FSR: present only the generated frames; not saved
 	bool g_fsr_hold = true;        // FSR: the character from the newest real frame in generated frames
+	bool g_sprite_mask = true;     // 1.2: build the exact character mask from Factorio's sprites
+	bool g_mask_fg = true;         // 1.2: ... and give it to frame generation (instead of guessing the character)
+	bool g_shadow_overlay = true;  // 1.2: its shadow laid over as a darkening (the ground under it moves with the camera)
+	bool g_hide_for_steam = true;  // 1.2: hide the frame generation window while the Steam overlay is open
+	bool g_steam_key = true;       // ... and watch Shift+Tab when Steam does not say
+	bool g_bridge_shown = true;    // what the bridge window was last set to
+	// stutter monitor: the last Factorio present, the add-on's work at it, what changed
+	LARGE_INTEGER g_present_at = {};
+	stutter::frame_info g_present_work = {};
+	uint32_t g_cuts_seen = 0;
+	int g_multiplier_seen = 0;
+	bool g_sprite_overlay = false; // ... and draw it over the frame (diagnostic, not saved)
 	bool g_fsr_inpaint = false;    // and painted over (with what is under it) in what frame generation blends (option)
 #ifdef FG_RELEASE
 	bool g_osd = false;              // readout drawn on the bridge picture (hotkey)
@@ -478,6 +498,11 @@ namespace
 		reshade::get_config_value(nullptr, CONFIG_SECTION, "WorldLayers", g_world_layers);
 		reshade::get_config_value(nullptr, CONFIG_SECTION, "FrameGenerationBackend", g_fg_choice);
 		reshade::get_config_value(nullptr, CONFIG_SECTION, "FsrHoldCharacter", g_fsr_hold);
+		reshade::get_config_value(nullptr, CONFIG_SECTION, "SpriteMask", g_sprite_mask);
+		reshade::get_config_value(nullptr, CONFIG_SECTION, "SpriteMaskForFrameGeneration", g_mask_fg);
+		reshade::get_config_value(nullptr, CONFIG_SECTION, "ShadowOverlay", g_shadow_overlay);
+		reshade::get_config_value(nullptr, CONFIG_SECTION, "HideForSteamOverlay", g_hide_for_steam);
+		reshade::get_config_value(nullptr, CONFIG_SECTION, "SteamOverlayKey", g_steam_key);
 		reshade::get_config_value(nullptr, CONFIG_SECTION, "PaintOverCharacter", g_fsr_inpaint);
 		g_fg_choice = std::clamp(g_fg_choice, 0, 2);
 		{
@@ -490,6 +515,7 @@ namespace
 				g_air_split_ps = static_cast<uint32_t>(std::strtoul(hexbuf, nullptr, 16));
 			reshade::get_config_value(nullptr, CONFIG_SECTION, "AltModeIconsBeforeSplit", g_air_icons_first);
 			reshade::get_config_value(nullptr, CONFIG_SECTION, "WideMoverSearch", g_wide_search);
+			reshade::get_config_value(nullptr, CONFIG_SECTION, "FloorFollowsCamera", g_floor_camera);
 			g_layer_ground_occ = std::max(g_layer_ground_occ, 1);
 			// Earlier defaults: BCD79626 (0.10.x, that is the floor stage) and 7C158CCA #2 (0.11.0, includes decoratives)
 			if (g_layer_ground_ps == LAYER_FLOOR_AFTER_PS || (g_layer_ground_ps == LAYER_GROUND_AFTER_PS && g_layer_ground_occ == 2))
@@ -603,6 +629,11 @@ namespace
 		reshade::set_config_value(nullptr, CONFIG_SECTION, "WorldLayers", g_world_layers);
 		reshade::set_config_value(nullptr, CONFIG_SECTION, "FrameGenerationBackend", g_fg_choice);
 		reshade::set_config_value(nullptr, CONFIG_SECTION, "FsrHoldCharacter", g_fsr_hold);
+		reshade::set_config_value(nullptr, CONFIG_SECTION, "SpriteMask", g_sprite_mask);
+		reshade::set_config_value(nullptr, CONFIG_SECTION, "SpriteMaskForFrameGeneration", g_mask_fg);
+		reshade::set_config_value(nullptr, CONFIG_SECTION, "ShadowOverlay", g_shadow_overlay);
+		reshade::set_config_value(nullptr, CONFIG_SECTION, "HideForSteamOverlay", g_hide_for_steam);
+		reshade::set_config_value(nullptr, CONFIG_SECTION, "SteamOverlayKey", g_steam_key);
 		reshade::set_config_value(nullptr, CONFIG_SECTION, "PaintOverCharacter", g_fsr_inpaint);
 		{
 			char hexbuf[16];
@@ -613,6 +644,7 @@ namespace
 			reshade::set_config_value(nullptr, CONFIG_SECTION, "AirSplitPixelShader", static_cast<const char *>(hexbuf));
 			reshade::set_config_value(nullptr, CONFIG_SECTION, "AltModeIconsBeforeSplit", g_air_icons_first);
 			reshade::set_config_value(nullptr, CONFIG_SECTION, "WideMoverSearch", g_wide_search);
+			reshade::set_config_value(nullptr, CONFIG_SECTION, "FloorFollowsCamera", g_floor_camera);
 		}
 		{
 			char buf[32];
@@ -676,9 +708,11 @@ namespace
 				break;
 			}
 		}
+		std::lock_guard<app_mutex> lock(g_mutex);
+		sprite_probe::on_init_pipeline(count, subobjects, pipe);
+		sprite_mask::on_init_pipeline(count, subobjects, pipe);
 		if (!any)
 			return;
-		std::lock_guard<app_mutex> lock(g_mutex);
 		g_pipeline_hash[pipe.handle] = h;
 	}
 
@@ -686,6 +720,8 @@ namespace
 	{
 		std::lock_guard<app_mutex> lock(g_mutex);
 		g_pipeline_hash.erase(pipe.handle);
+		sprite_probe::on_destroy_pipeline(pipe);
+		sprite_mask::on_destroy_pipeline(pipe);
 	}
 
 	void on_bind_pipeline(command_list *cmd_list, pipeline_stage stages, pipeline pipe)
@@ -702,6 +738,56 @@ namespace
 		if ((stages & pipeline_stage::vertex_shader) == pipeline_stage::vertex_shader) g_cur_vs = h;
 		if ((stages & pipeline_stage::pixel_shader) == pipeline_stage::pixel_shader) g_cur_ps = h;
 		if ((stages & pipeline_stage::output_merger) == pipeline_stage::output_merger) g_cur_blend = h;
+		if ((stages & pipeline_stage::input_assembler) == pipeline_stage::input_assembler)
+		{
+			sprite_probe::on_bind_input_layout(pipe);
+			sprite_mask::on_bind_input_layout(pipe);
+		}
+	}
+
+	// Vertex / index buffer bindings and buffer copies: only followed while the sprite probe records.
+	void on_bind_vertex_buffers(command_list *cmd_list, uint32_t first, uint32_t count, const resource *buffers, const uint64_t *offsets, const uint32_t *strides)
+	{
+		if (!sprite_probe::active() && !sprite_mask::enabled())
+			return;
+		std::lock_guard<app_mutex> lock(g_mutex);
+		if (cmd_list->get_device() == g_device)
+		{
+			sprite_probe::on_bind_vertex_buffers(first, count, buffers, offsets, strides);
+			sprite_mask::on_bind_vertex_buffers(first, count, buffers, offsets, strides);
+		}
+	}
+
+	void on_bind_index_buffer(command_list *cmd_list, resource buffer, uint64_t offset, uint32_t index_size)
+	{
+		if (!sprite_probe::active() && !sprite_mask::enabled())
+			return;
+		std::lock_guard<app_mutex> lock(g_mutex);
+		if (cmd_list->get_device() == g_device)
+		{
+			sprite_probe::on_bind_index_buffer(buffer, offset, index_size);
+			sprite_mask::on_bind_index_buffer(buffer, offset, index_size);
+		}
+	}
+
+	bool on_copy_buffer_region(command_list *cmd_list, resource source, uint64_t source_offset, resource dest, uint64_t dest_offset, uint64_t size)
+	{
+		if (!sprite_probe::active())
+			return false;
+		std::lock_guard<app_mutex> lock(g_mutex);
+		if (cmd_list->get_device() == g_device)
+			sprite_probe::on_copy(source, source_offset, dest, dest_offset, size);
+		return false;
+	}
+
+	bool on_copy_resource(command_list *cmd_list, resource source, resource dest)
+	{
+		if (!sprite_probe::active())
+			return false;
+		std::lock_guard<app_mutex> lock(g_mutex);
+		if (cmd_list->get_device() == g_device)
+			sprite_probe::on_copy(source, 0, dest, 0, UINT64_MAX);
+		return false;
 	}
 
 	void on_bind_render_targets(command_list *cmd_list, uint32_t count, const resource_view *rtvs, resource_view)
@@ -716,6 +802,7 @@ namespace
 
 	void destroy_swapchain_resources(device *dev)
 	{
+		sprite_mask::shutdown();
 		if (g_preview_srv.handle != 0) dev->destroy_resource_view(g_preview_srv);
 		if (g_preview.handle != 0) dev->destroy_resource(g_preview);
 		for (uint32_t i = 0; i < PREVIEW_RING; ++i)
@@ -836,6 +923,25 @@ namespace
 		reshade::log::message(reshade::log::level::info, message);
 	}
 
+	// The bridge window covers Factorio's own picture; overlays drawn into Factorio's frames (ReShade's, Steam's) need
+	// it out of the way while they are open. Present thread only.
+	void update_visibility(bool force)
+	{
+		const bool steam = g_hide_for_steam && steam_overlay::active();
+		const bool shown = !g_overlay_open && !steam;
+		static bool steam_seen = false;
+		if (steam != steam_seen)
+		{
+			steam_seen = steam;
+			log_info("HUD-less probe: Steam overlay %s - frame generation window %s", steam ? "open" : "closed", shown ? "shown" : "hidden");
+		}
+		if (force || shown != g_bridge_shown)
+		{
+			g_bridge_shown = shown;
+			bridge::set_visible(shown);
+		}
+	}
+
 	// Runs at Factorio's present, after the HUD-less copy for this frame is final.
 	void bridge_frame(command_queue *queue, swapchain *sc)
 	{
@@ -864,8 +970,10 @@ namespace
 			g_bridge_failed = !ok;
 			if (!ok)
 				return;
-			bridge::set_visible(!g_overlay_open);
+			update_visibility(true);
 		}
+		steam_overlay::update(g_game_window, g_steam_key);
+		update_visibility(false);
 		bridge::present_options options;
 		options.allow_tearing = g_bridge_tearing;
 		options.fg_multiplier = effective_multiplier();
@@ -881,6 +989,7 @@ namespace
 		options.fg_only_generated = g_fsr_only_generated;
 		options.fg_hold_character = g_fsr_hold;
 		options.fg_inpaint_character = g_fsr_inpaint;
+		options.fg_shadow_overlay = g_shadow_overlay;
 		options.motion_far_penalty = g_motion_far_penalty;
 		// Map view (and anything else without the game view's post pass): nothing follows the camera, so nothing is
 		// still. The boundary rule's anchor only matches in the game view.
@@ -891,6 +1000,7 @@ namespace
 		options.motion_debug_layer_view = static_cast<uint32_t>(g_debug_mode);
 		options.motion_icons_first = g_air_icons_first;
 		options.motion_wide_search = g_wide_search;
+		options.motion_floor_camera = g_floor_camera;
 		options.scene_cut_detection = g_scene_cut;
 		options.scene_cut_factor = g_scene_cut_factor;
 		ID3D11Texture2D *layer_textures[bridge::LAYER_COUNT] = {};
@@ -907,7 +1017,7 @@ namespace
 			reinterpret_cast<ID3D11Texture2D *>(bb.handle),
 			g_hudless.handle != 0 ? reinterpret_cast<ID3D11Texture2D *>(g_hudless.handle) : nullptr,
 			g_layers_last_frame ? layer_textures : nullptr, g_layers_direct_last ? g_layers_gen_last : bridge::layer_generation(),
-			options);
+			g_sprite_mask && g_mask_fg && sprite_mask::valid() ? sprite_mask::mask() : nullptr, options);
 		if (!bridge::active())
 			g_bridge_failed = true; // the bridge shut itself down (timeout, device error); do not restart it every frame
 	}
@@ -1102,6 +1212,13 @@ namespace
 
 	void on_init_resource(device *dev, const resource_desc &desc, const subresource_data *initial_data, resource_usage, resource res)
 	{
+		if (dev->get_api() == device_api::d3d11 && desc.type == resource_type::buffer &&
+			(desc.usage & (resource_usage::vertex_buffer | resource_usage::index_buffer)) != resource_usage::undefined)
+		{
+			std::lock_guard<app_mutex> lock(g_mutex);
+			sprite_probe::on_init_resource(desc, initial_data, res);
+			sprite_mask::on_init_resource(desc, initial_data, res);
+		}
 		if (dev->get_api() != device_api::d3d11 || desc.type != resource_type::buffer ||
 			(desc.usage & resource_usage::constant_buffer) != resource_usage::constant_buffer)
 			return;
@@ -1116,6 +1233,8 @@ namespace
 		if (dev->get_api() != device_api::d3d11)
 			return;
 		std::lock_guard<app_mutex> lock(g_mutex);
+		sprite_probe::on_destroy_resource(res);
+		sprite_mask::on_destroy_resource(res);
 		if (g_cb_handles.erase(res.handle) != 0)
 		{
 			g_cb_latest.erase(res.handle);
@@ -1125,6 +1244,16 @@ namespace
 
 	void on_map_buffer(device *dev, resource res, uint64_t, uint64_t size, map_access access, void **data)
 	{
+		if (sprite_probe::active() && dev == g_device && access != map_access::read_only && data != nullptr && *data != nullptr)
+		{
+			std::lock_guard<app_mutex> lock(g_mutex);
+			sprite_probe::on_map(res, access, *data);
+		}
+		if (sprite_mask::enabled() && dev == g_device && access != map_access::read_only && data != nullptr && *data != nullptr)
+		{
+			std::lock_guard<app_mutex> lock(g_mutex);
+			sprite_mask::on_map(res, access, *data);
+		}
 		if (!g_cam_probe || dev != g_device || access == map_access::read_only || data == nullptr || *data == nullptr)
 			return;
 		std::lock_guard<app_mutex> lock(g_mutex);
@@ -1134,6 +1263,11 @@ namespace
 
 	void on_unmap_buffer(device *dev, resource res)
 	{
+		if (sprite_probe::active() && dev == g_device)
+		{
+			std::lock_guard<app_mutex> lock(g_mutex);
+			sprite_probe::on_unmap(res);
+		}
 		if (!g_cam_probe || dev != g_device)
 			return;
 		std::lock_guard<app_mutex> lock(g_mutex);
@@ -1146,6 +1280,11 @@ namespace
 
 	bool on_update_buffer(device *dev, const void *data, resource dest, uint64_t dest_offset, uint64_t size)
 	{
+		if (sprite_probe::active() && dev == g_device)
+		{
+			std::lock_guard<app_mutex> lock(g_mutex);
+			sprite_probe::on_update(dest, dest_offset, data, size);
+		}
 		if (!g_cam_probe || dev != g_device || data == nullptr || dest_offset != 0)
 			return false;
 		std::lock_guard<app_mutex> lock(g_mutex);
@@ -1156,6 +1295,25 @@ namespace
 
 	void on_push_descriptors(command_list *cmd_list, shader_stage stages, pipeline_layout, uint32_t, const descriptor_table_update &update)
 	{
+		if (sprite_mask::enabled() && update.type == descriptor_type::shader_resource_view && (stages & shader_stage::pixel) == shader_stage::pixel &&
+			update.binding == 0 && update.count != 0 && cmd_list->get_device() == g_device)
+		{
+			std::lock_guard<app_mutex> lock(g_mutex);
+			const auto *views = static_cast<const resource_view *>(update.descriptors);
+			sprite_mask::on_bind_ps_view(0, views != nullptr ? views[0].handle : 0);
+		}
+		if (sprite_probe::active() && update.type == descriptor_type::shader_resource_view &&
+			(stages & shader_stage::pixel) == shader_stage::pixel && cmd_list->get_device() == g_device && update.binding < 2)
+		{
+			std::lock_guard<app_mutex> lock(g_mutex);
+			const auto *views = static_cast<const resource_view *>(update.descriptors);
+			for (uint32_t i = 0; i < update.count && update.binding + i < 2; ++i)
+			{
+				const resource tex = native_resource_from_view(views != nullptr ? views[i] : resource_view { 0 });
+				const resource_desc &td = cached_desc(tex);
+				sprite_probe::on_bind_ps_texture(update.binding + i, tex.handle, tex.handle != 0 ? td.texture.width : 0, tex.handle != 0 ? td.texture.height : 0);
+			}
+		}
 		if (!g_cam_probe || update.type != descriptor_type::constant_buffer ||
 			(stages & shader_stage::vertex) != shader_stage::vertex || cmd_list->get_device() != g_device)
 			return;
@@ -1456,15 +1614,56 @@ namespace
 		}
 	}
 
-	bool on_draw(command_list *cmd_list, uint32_t vertices, uint32_t instances, uint32_t, uint32_t)
+	// Where in the frame a draw happens, for the sprite probe: 0 tiles, 1 floor (belts, shadows), 2 objects, 3 air, 4 after.
+	void sprite_probe_draw(command_list *cmd_list, bool indexed, uint32_t count, uint32_t instances, uint32_t first, int32_t vertex_offset, uint32_t first_instance)
+	{
+		std::lock_guard<app_mutex> lock(g_mutex);
+		if (g_device == nullptr || cmd_list->get_device() != g_device)
+			return;
+		sprite_probe::draw_info d;
+		d.vs = g_cur_vs;
+		d.ps = g_cur_ps;
+		d.indexed = indexed;
+		d.count = count;
+		d.instances = instances;
+		d.first = first;
+		d.vertex_offset = vertex_offset;
+		d.first_instance = first_instance;
+		d.world = g_layer_rt.handle != 0 && g_cur_rt == g_layer_rt;
+		d.rt = g_cur_rt.handle;
+		if (!d.world && g_cur_rt.handle != 0 && !is_back_buffer(g_cur_rt))
+		{
+			// any target with the screen's size, whatever its format (a shadow layer may be single-channel)
+			const resource_desc &td = cached_desc(g_cur_rt);
+			d.screen = td.type == resource_type::texture_2d && td.texture.width == g_bb_desc.texture.width && td.texture.height == g_bb_desc.texture.height;
+			d.rt_fmt = static_cast<uint32_t>(td.texture.format);
+		}
+		d.stage = g_layer_world_done ? 4 : g_layer_entities_done ? 3 : g_layer_floor_done ? 2 : (g_layer_ground_done || g_layer_ground_pending) ? 1 : 0;
+		if (g_layer_ground_pending && !g_layer_ground_done)
+			d.stage = 0; // the tile draw itself
+		if (g_cur_rt.handle != 0)
+		{
+			const resource_desc &rd = cached_desc(g_cur_rt);
+			d.rt_w = rd.texture.width;
+			d.rt_h = rd.texture.height;
+		}
+		sprite_probe::on_draw(d);
+		sprite_mask::on_draw(d);
+	}
+
+	bool on_draw(command_list *cmd_list, uint32_t vertices, uint32_t instances, uint32_t first_vertex, uint32_t first_instance)
 	{
 		on_any_draw(cmd_list, vertices, instances, false);
+		if (sprite_probe::active() || sprite_mask::enabled())
+			sprite_probe_draw(cmd_list, false, vertices, instances, first_vertex, 0, first_instance);
 		return false;
 	}
 
-	bool on_draw_indexed(command_list *cmd_list, uint32_t indices, uint32_t instances, uint32_t, int32_t, uint32_t)
+	bool on_draw_indexed(command_list *cmd_list, uint32_t indices, uint32_t instances, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
 	{
 		on_any_draw(cmd_list, indices, instances, true);
+		if (sprite_probe::active() || sprite_mask::enabled())
+			sprite_probe_draw(cmd_list, true, indices, instances, first_index, vertex_offset, first_instance);
 		return false;
 	}
 
@@ -1685,6 +1884,7 @@ namespace
 		std::lock_guard<app_mutex> lock(g_mutex);
 		if (g_device == nullptr || sc->get_device() != g_device)
 			return false;
+		sprite_probe::frame_end();
 
 		LARGE_INTEGER now, freq;
 		QueryPerformanceCounter(&now);
@@ -1715,6 +1915,25 @@ namespace
 		}
 		if (!g_captured_this_frame && !g_auto_captured)
 			capture_hudless(queue->get_immediate_command_list(), native_back_buffer(sc));
+		// The character mask from this frame's sprites (and the debug overlay, drawn onto the frame itself).
+		static bool mask_dump_dir_set = false;
+		if (!mask_dump_dir_set)
+		{
+			std::error_code ec;
+			std::filesystem::create_directories(output_dir(), ec);
+			stutter::set_output(output_dir().wstring(), sprite_log);
+			mask_dump_dir_set = true;
+		}
+		// mask dumps (sprite_mask_N.txt) only with the developer tools shown: they are for reports, not for everyone
+		static int dumps_for = -1;
+		if (dumps_for != (g_dev_tools ? 1 : 0))
+		{
+			dumps_for = g_dev_tools ? 1 : 0;
+			sprite_mask::set_dump_dir(g_dev_tools ? output_dir().c_str() : L"");
+		}
+		sprite_mask::set_enabled(g_sprite_mask);
+		sprite_mask::frame_end(reinterpret_cast<ID3D11Device *>(g_device->get_native()), reinterpret_cast<ID3D11DeviceContext *>(queue->get_native()),
+			reinterpret_cast<ID3D11Texture2D *>(native_back_buffer(sc).handle), g_bb_desc.texture.width, g_bb_desc.texture.height, g_sprite_mask && g_sprite_overlay);
 
 		g_last_draw_count = g_draw_index;
 		g_last_matched_at = g_matched_at;
@@ -1807,10 +2026,49 @@ namespace
 		// Device check first: this event also fires for the bridge's own D3D12 swap chain, from inside bridge::present.
 		if (g_device == nullptr || sc->get_device() != g_device)
 			return;
+		LARGE_INTEGER t0, t1, t2, freq;
+		QueryPerformanceCounter(&t0);
+		QueryPerformanceFrequency(&freq);
+		const auto ms = [&](const LARGE_INTEGER &a, const LARGE_INTEGER &b) {
+			return static_cast<double>(b.QuadPart - a.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart);
+		};
+		const double interval = g_present_at.QuadPart != 0 ? ms(g_present_at, t0) : 0.0;
+		g_present_at = t0;
 		if (!present_locked(queue, sc))
 			return;
+		QueryPerformanceCounter(&t1);
 		// The bridge runs outside the lock: its D3D12 calls make ReShade raise events into this add-on.
 		bridge_frame(queue, sc);
+		QueryPerformanceCounter(&t2);
+
+		// Stutter monitor: this frame's interval with the work at the last present and this frame's draw-time costs.
+		const sprite_mask::frame_costs mc = sprite_mask::last_costs();
+		stutter::frame_info fi = g_present_work;
+		fi.mask_draw_ms = mc.draw_ms;
+		fi.mask_draws = mc.draws;
+		fi.mask_own_maps = mc.own_maps;
+		fi.mask_vertex_kb = mc.vertex_kb;
+		fi.mask_copy_all = mc.copy_all;
+		fi.base_fps = g_base_fps;
+		fi.multiplier = effective_multiplier();
+		stutter::frame(interval, fi);
+		// this present's work, for the next frame's interval
+		const bridge::timings bt = bridge::get_timings();
+		stutter::frame_info w = {};
+		w.present_ms = static_cast<float>(ms(t0, t2));
+		w.bridge_ms = static_cast<float>(ms(t1, t2));
+		w.cut_wait_ms = bt.last_cut_wait_ms;
+		w.alloc_wait_ms = bt.last_alloc_wait_ms;
+		w.present_call_ms = bt.last_present_call_ms;
+		w.mask_end_ms = mc.end_ms;
+		w.mask_dump_ms = mc.dump_ms;
+		w.mask_dumped = mc.dumped;
+		w.mask_valid = !g_sprite_mask || sprite_mask::valid();
+		w.scene_cut = bt.scene_cuts != g_cuts_seen;
+		w.multiplier_changed = g_multiplier_seen != 0 && g_multiplier_seen != fi.multiplier;
+		g_cuts_seen = bt.scene_cuts;
+		g_multiplier_seen = fi.multiplier;
+		g_present_work = w;
 	}
 
 	// On-screen readout. ReShade raises this for every runtime every frame, even with its overlay closed. The bridge's
@@ -1830,6 +2088,29 @@ namespace
 			std::snprintf(buf, size, "Factorio FG: compiling motion shaders (%d/%d, once after an update, up to a minute) - frame generation runs\n"
 				"without motion vectors until then", compiled, total);
 		return true;
+	}
+
+	// The shadow's state and measured darkness (settings panel and on-screen readout).
+	void shadow_line(char *buf, size_t size)
+	{
+		bridge::shadow_info si = {};
+		const bool used = bridge::active() && bridge::shadow_darkness(si);
+		if (!bridge::active() || !bridge::exact_mask_used())
+		{
+			std::snprintf(buf, size, "Shadow: not from the exact mask");
+			return;
+		}
+		char v[4][24];
+		for (int i = 0; i < 4; ++i)
+		{
+			if (si.frames[i] >= 3)
+				std::snprintf(v[i], sizeof(v[i]), "%.2f", si.k[i]);
+			else
+				std::snprintf(v[i], sizeof(v[i]), "?(%u)", si.samples[i]);
+		}
+		std::snprintf(buf, size, "Shadow: %s | darkness on ground: walking %s, flying %s | on objects: walking %s, flying %s",
+			!g_shadow_overlay ? "held as it is (darkening off)" : used ? "laid over as a darkening" : "held as it is until measured (run around)",
+			v[0], v[1], v[2], v[3]);
 	}
 
 	void on_reshade_overlay(effect_runtime *runtime)
@@ -1880,13 +2161,27 @@ namespace
 				ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "GUI capture: %s - the GUI is not kept out of frame generation",
 					g_mode == boundary_mode::off ? "OFF (HUD-less capture tab: Use Factorio default rule)" : (g_last_auto_at >= 0 ? "fallback" : "none"));
 			ImGui::Text("%s", bridge::fg_status()); // UI layer, character held / painted over, diagnostics
+			if (g_sprite_mask && g_mask_fg)
+			{
+				char line[256];
+				sprite_mask::readout(line, sizeof(line));
+				ImGui::Text("%s", line);
+				shadow_line(line, sizeof(line));
+				ImGui::Text("%s", line);
+			}
 			if (const char *warning = capture_warning())
 				ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "%s", warning);
 			if (setup::problems() > 0)
 				ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "Setup: %d problem(s), see the Frame generation tab", setup::problems());
+			{
+				char line[320];
+				stutter::readout(line, sizeof(line));
+				ImGui::Text("%s", line);
+			}
 			const bridge::timings t = bridge::get_timings();
-			ImGui::Text("GPU motion %.2f ms (camera %.2f, blocks %.2f, rest %.2f) | cut check wait %.2f ms | bridge CPU %.2f ms | cuts %u",
-				t.motion_gpu_ms, t.motion_camera_ms, t.motion_block_ms, t.motion_rest_ms, t.cut_wait_ms, t.present_cpu_ms, t.scene_cuts);
+			ImGui::Text("GPU motion %.2f ms (camera %.2f, blocks %.2f, rest %.2f) | cut check wait %.2f ms (%u judged a frame late) | bridge CPU %.2f ms | cuts %u (%u late)",
+				t.motion_gpu_ms, t.motion_camera_ms, t.motion_block_ms, t.motion_rest_ms, t.cut_wait_ms, t.cut_checks_late, t.present_cpu_ms, t.scene_cuts,
+				t.cuts_late);
 			ImGui::Text("Searched blocks %u | wide %u | movers %u", t.blocks_searched, t.blocks_wide, t.movers_found);
 		}
 		ImGui::End();
@@ -1900,7 +2195,7 @@ namespace
 		// No lock: ReShade raises this from its own GUI code on the present thread; taking g_mutex here could
 		// nest inside another callback. The bridge and this flag are only touched from that thread.
 		g_overlay_open = open;
-		bridge::set_visible(!open); // the ReShade overlay is drawn on Factorio's own swap chain, under the bridge window
+		update_visibility(true); // the ReShade overlay is drawn on Factorio's own swap chain, under the bridge window
 		return false;
 	}
 
@@ -2056,8 +2351,13 @@ namespace
 			ImGui::TextWrapped("%s: %s", bridge::backend_name(), bridge::fg_status());
 			if (bridge::max_multiplier() < 4 && bridge::active())
 				ImGui::TextDisabled("  %s generates one frame per Factorio frame: 2x at most.", bridge::backend_name());
-			changed |= ImGui::Checkbox("Keep the character sharp", &g_fsr_hold);
-			ImGui::TextDisabled("  While you move, generated frames show the character from the newest Factorio frame (laid over them like the GUI) instead of a blend of two animation poses.");
+			ImGui::TextUnformatted("Character in generated frames:");
+			ImGui::SameLine();
+			if (ImGui::RadioButton("laid over##charmode", g_fsr_hold)) { g_fsr_hold = true; changed = true; }
+			ImGui::SameLine();
+			if (ImGui::RadioButton("generated##charmode", !g_fsr_hold)) { g_fsr_hold = false; changed = true; }
+			ImGui::TextDisabled("  Laid over: the character from the newest Factorio frame, like the GUI - always sharp, its animation steps at Factorio's frame rate.\n"
+				"  Generated: frame generation interpolates it too, with its own motion (with the exact mask: it stays put on screen) - smoother, may blend two animation poses.");
 			ImGui::BeginDisabled(!g_fsr_hold);
 			changed |= ImGui::Checkbox("  ...and remove it from what frame generation blends", &g_fsr_inpaint);
 			ImGui::EndDisabled();
@@ -2095,6 +2395,18 @@ namespace
 				if (ImGui::Button("Set hotkey"))
 					g_osd_key_capture = true;
 			}
+			changed |= ImGui::Checkbox("Hide frame generation while the Steam overlay is open (else it opens unseen, under it)", &g_hide_for_steam);
+			ImGui::BeginDisabled(!g_hide_for_steam);
+			changed |= ImGui::Checkbox("If Steam does not say, go by Shift+Tab (Esc or Shift+Tab again: closed)", &g_steam_key);
+			ImGui::EndDisabled();
+			{
+				char line[256];
+				steam_overlay::status(line, sizeof(line));
+				ImGui::TextDisabled("  %s", line);
+				stutter::readout(line, sizeof(line));
+				ImGui::TextDisabled("  %s", line);
+				ImGui::TextDisabled("  (each stutter is logged with what took the time: ReShade.log and hudless_probe\\stutters.txt)");
+			}
 			if (changed)
 				save_config();
 			ImGui::TextDisabled("The frame-generated picture is hidden while this overlay is open. Close the overlay (Home) to see it.");
@@ -2126,6 +2438,60 @@ namespace
 		if (ImGui::BeginTabItem("Motion vectors", nullptr, 0))
 		{
 			ImGui::PushItemWidth(-ImGui::GetFontSize() * 13.0f);
+			if (ImGui::CollapsingHeader("Character tracking (from Factorio's sprites)", ImGuiTreeNodeFlags_DefaultOpen))
+			{
+				if (ImGui::Checkbox("Build the character mask from Factorio's sprites", &g_sprite_mask))
+					save_config();
+				ImGui::SameLine();
+				ImGui::BeginDisabled(!g_sprite_mask);
+				ImGui::Checkbox("Show it (red: character, blue: its shadow)", &g_sprite_overlay);
+				ImGui::EndDisabled();
+				ImGui::TextWrapped("Mask: %s", g_sprite_mask ? sprite_mask::status() : "off");
+				if (g_dev_tools)
+				{
+					if (ImGui::Button("Write what is near the centre now##maskdump"))
+						sprite_mask::dump_now();
+					ImGui::SameLine();
+					ImGui::TextDisabled("(also written automatically when the character is lost: hudless_probe\\sprite_mask_N.txt)");
+				}
+				ImGui::BeginDisabled(!g_sprite_mask);
+				if (ImGui::Checkbox("Use it for frame generation (instead of guessing the character from its motion)", &g_mask_fg))
+					save_config();
+				ImGui::EndDisabled();
+				ImGui::TextDisabled("Frame generation: %s", !bridge::active() ? "not running" :
+					bridge::exact_mask_used() ? "uses the exact mask (character and shadow stay put on screen, nothing else is held)" :
+					"guesses the character from its motion (as in 1.1)");
+				ImGui::BeginDisabled(!g_sprite_mask || !g_mask_fg);
+				if (ImGui::Checkbox("Lay its shadow over as a darkening (the ground under it moves with the world)", &g_shadow_overlay))
+					save_config();
+				ImGui::EndDisabled();
+				{
+					char line[256];
+					shadow_line(line, sizeof(line));
+					ImGui::TextDisabled("%s", line);
+					ImGui::TextDisabled("  (darkness per mask coverage, measured while the camera moves; \"?\" not yet, samples last frame in brackets.\n"
+						"  On objects ~0 means they are drawn over the shadow and are not darkened)");
+				}
+				ImGui::Separator();
+			}
+			if (g_dev_tools && ImGui::CollapsingHeader("Sprite probe (1.2 step 0)", 0))
+			{
+				ImGui::TextWrapped("Records how Factorio sends its sprites to the GPU, for 6 seconds. Click Record, close this overlay and keep "
+					"running around (change direction a few times). Nothing changes in the picture; a short stutter every half second is "
+					"expected. Then send ReShade.log and the file named below.");
+				if (sprite_probe::active())
+					ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "Recording...");
+				else if (ImGui::Button("Record 6 s##sprite"))
+				{
+					static int run = 0;
+					wchar_t name[64];
+					std::swprintf(name, 64, L"sprite_probe_%d.txt", ++run);
+					sprite_probe::start(output_dir() / name, 360);
+				}
+				ImGui::SameLine();
+				ImGui::TextWrapped("Status: %s", sprite_probe::status());
+				ImGui::Separator();
+			}
 			bool changed = ImGui::Checkbox("Motion vectors (estimated from the image)", &g_motion_vectors);
 			ImGui::SameLine();
 			changed |= ImGui::Checkbox("Flip sign (diagnostic)", &g_motion_flip);
@@ -2208,6 +2574,9 @@ namespace
 			ImGui::TextDisabled("  Finds trains, cars, bots by searching each block; off = only follow motion found earlier, as before 0.9.");
 			changed |= ImGui::Checkbox("Wide search for fast movers", &g_wide_search);
 			ImGui::TextDisabled("  Up to 192 px per frame instead of 48, where the normal search finds nothing: fast trains.");
+			changed |= ImGui::Checkbox("Belts and other floor: own motion only where it is certain", &g_floor_camera);
+			ImGui::TextDisabled("  Belts, rails, pipes, grass move with the world unless a belt's motion is unambiguous there (items and surface\n"
+				"  slide); a repeating empty belt surface or two belts in opposite directions no longer stick or blur. Off: as before 1.2.");
 			ImGui::TextDisabled("  Depth for DLSS-G comes from the world layers. %s", bridge::depth_status());
 			if (ImGui::CollapsingHeader("Fine tuning", 0))
 			{
@@ -2661,10 +3030,18 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 		reshade::register_event<reshade::addon_event::unmap_buffer_region>(on_unmap_buffer);
 		reshade::register_event<reshade::addon_event::update_buffer_region>(on_update_buffer);
 		reshade::register_event<reshade::addon_event::push_descriptors>(on_push_descriptors);
+		reshade::register_event<reshade::addon_event::bind_vertex_buffers>(on_bind_vertex_buffers);
+		reshade::register_event<reshade::addon_event::bind_index_buffer>(on_bind_index_buffer);
+		reshade::register_event<reshade::addon_event::copy_buffer_region>(on_copy_buffer_region);
+		reshade::register_event<reshade::addon_event::copy_resource>(on_copy_resource);
+		sprite_probe::set_log(sprite_log);
+		sprite_mask::set_log(sprite_log);
 		reshade::register_overlay(ADDON_DISPLAY_NAME, draw_overlay);
 		log_info("HUD-less probe " ADDON_VERSION_STRING " (" ADDON_VERSION_STAGE ", built %s) loaded", BUILD_STAMP);
 		break;
 	case DLL_PROCESS_DETACH:
+		steam_overlay::shutdown();
+		stutter::flush();
 		reshade::unregister_addon(module);
 		break;
 	}

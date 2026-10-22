@@ -45,6 +45,9 @@ namespace motion
 		bool spread_depth = false;  // depth for FSR: same layer order, values spread far apart in distance
 		bool hold_as_ground = false; // the held character is painted over in the frame generation input: give its pixels
 		                             // the camera's motion and the ground's depth (what is there now is the world)
+		bool floor_camera = true;    // 1.2: floor pixels (belts, rails, grass) take the camera's motion and the ground's depth
+		bool shadow_overlay = false; // 1.2: the UI layer lays the character's shadow over as a darkening: once its darkness
+		                             // is measured, the ground under the shadow gets the camera's motion (exact mask only)
 	};
 
 	// Starts compiling the shaders on a worker thread (or loads them from the cache). Optional; init() does it too.
@@ -69,6 +72,9 @@ namespace motion
 		ID3D12Resource *postcloud = nullptr; // right after the cloud pass
 		ID3D12Resource *world = nullptr;     // complete, before the composite pass (air stage: bots, icons)
 		ID3D12Resource *airsplit = nullptr;  // in the air stage, before the first draw of the split shader
+		// 1.2: the exact character mask from Factorio's sprites (R8G8B8A8_UNORM: R character, G its shadow, B flying;
+		// COMMON, returned so). With it the character is not guessed: its pixels (and only those) stay put on screen.
+		ID3D12Resource *character = nullptr;
 	};
 	// 'split' (optional): called once the scene-cut metric is on its way to the CPU (current_difference() valid after
 	// that part completes); it must close, submit and reset 'list'. Recording then continues on 'list'.
@@ -97,8 +103,15 @@ namespace motion
 	// Depth from the world layers (R32_FLOAT, UNORDERED_ACCESS state, 0.25 placed on the ground / 0.75 bare ground;
 	// flat 0.75 without layers), or nullptr.
 	ID3D12Resource *depth_texture();
-	// R8_UNORM, full res, UAV state: 1 where the character is held still while the camera moves (FSR keeps it sharp)
+	// R8_UNORM, full res, UAV state: 1 where the character is held still while the camera moves (FSR keeps it sharp),
+	// 0.5 flying, 0.8 its shadow held as it is; below 0.25 the shadow laid over as a darkening (value x 4 = darkness)
 	ID3D12Resource *hold_texture();
+	bool exact_mask_used(); // the last frame used the exact character mask
+	// The shadow's darkness per unit of mask coverage, measured where the camera moves the world across its edge (a
+	// few frames old), per class: 0 walking, 1 flying - on ground / floor; 2 walking, 3 flying - on objects. Valid once
+	// frames >= 3. True if the shadow is being laid over as a darkening (on ground at least).
+	struct shadow_info { float k[4]; uint32_t frames[4], samples[4]; };
+	bool shadow_darkness(shadow_info &out);
 	// Motion debug picture of the frame just recorded (UNORDERED_ACCESS state, colour format), or nullptr.
 	ID3D12Resource *debug_texture();
 	// Share of blocks (0..1) moving with the camera / still / with their own motion, a few frames old.

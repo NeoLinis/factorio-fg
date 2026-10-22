@@ -11,6 +11,7 @@
 // its own optical flow, so expect smearing on fast pans.
 
 #include "fg_streamline.h"
+#include "ui_layer.h"
 
 #include <sl.h>
 #include <sl_consts.h>
@@ -562,7 +563,7 @@ namespace fg_sl
 		set_status("DLSS-G %s | status %s | max %ux | last present showed %u frame(s)%s",
 			g_applied_multiplier > 1 ? (std::to_string(g_applied_multiplier) + "x").c_str() : "off",
 			status_text(g_dlssg_status), g_frames_max + 1, g_frames_presented,
-			g_applied_ui ? (clean != nullptr ? " | UI layer, character painted over" : " | UI layer") : "");
+			g_applied_ui ? (clean != nullptr && ui_layer::inpainted() ? " | UI layer, character painted over" : " | UI layer") : "");
 	}
 
 	void present_start()
@@ -629,6 +630,11 @@ namespace fg_sl
 	const char *status()
 	{
 		return g_status;
+	}
+
+	bool ui_supported()
+	{
+		return !g_ui_unsupported;
 	}
 
 	const char *depth_status()
