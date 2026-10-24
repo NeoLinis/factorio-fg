@@ -11,6 +11,7 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <cstdint>
+#include <string>
 
 namespace bridge
 {
@@ -42,6 +43,16 @@ namespace bridge
 		bool motion_icons_first = true;
 		bool motion_wide_search = true;
 		bool motion_floor_camera = true;      // 1.2: belts and other floor move with the world (see motion::settings)
+		bool motion_sprite_camera = true;     // 1.3: use the camera shift from the sprites when it is exact
+		bool motion_icon_depth_flat = true;   // 1.3 beta 3: alt-mode icons at the depth of the building under them
+		bool motion_fit_measure = true;       // 1.3 beta 4: run the motion fit pass
+		int sprite_camera_support = 0, sprite_camera_tight = 0; // diagnostics (camera trace)
+		bool motion_icon_motion = true;       // 1.3 beta 5: alt-mode icons moved by their own sprites' shift
+		bool icon_shift_valid = false;
+		float icon_dx = 0, icon_dy = 0;
+		float stage_diag[12] = {};
+		bool sprite_camera_valid = false;     // ... this frame's: known exactly
+		float sprite_camera_dx = 0, sprite_camera_dy = 0; // ... world sprites' shift since the last frame, full-res px
 		bool scene_cut_detection = true;      // tell DLSS-G to start over when the picture changes completely
 		float scene_cut_factor = 4.0f;        // cut when the frame difference exceeds this many times its running average
 		float scene_cut_min_difference = 0.08f; // ...and this absolute mean luma difference (0..1); 0.04 until beta 34 cut
@@ -116,4 +127,12 @@ namespace bridge
 	const char *depth_status(); // depth tagging status for the overlay
 	bool layers_used();         // the last frame used the world layers
 	void motion_shares(float &camera, float &still, float &own); // share of blocks per kind, 0..1
+	// 1.3: where the camera shift came from and how far the picture fit is from the sprites' (readout line).
+	const char *camera_line();
+	// 1.3: motion fit per layer (readout line): the previous frame moved by the motion vectors vs the new one.
+	const char *fit_line();
+	// 1.3 beta 4: camera trace (see motion::trace_start / trace_take).
+	bool camera_trace_start(uint32_t frames); // false if the motion pass is not running
+	bool camera_trace_take(std::string &out);
+	int camera_trace_left();                  // frames still to record
 }

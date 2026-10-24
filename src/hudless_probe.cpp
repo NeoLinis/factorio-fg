@@ -35,6 +35,7 @@
 #include <cinttypes>
 #include <cstdarg>
 #include <cstdlib>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -177,6 +178,14 @@ namespace
 	bool g_air_icons_first = true;     // icons are drawn before the split
 	bool g_wide_search = true;         // wide mover search (fast trains)
 	bool g_floor_camera = true;        // 1.2: belts and other floor move with the world
+	bool g_sprite_camera = true;       // 1.3: the camera's shift from Factorio's sprites when they give it exactly
+	bool g_icon_depth_flat = true;     // 1.3 beta 3: alt-mode icons at the depth of the building under them
+	bool g_fit_measure = true;         // 1.3 beta 4: motion fit pass (readout)
+	bool g_icon_motion = false;        // 1.3 beta 5: alt-mode icons moved by their own sprites' shift (beta 6: off -
+	                                   // in vanilla they move exactly with the world; kept for mods)
+	bool g_trace_waiting = false;      // a camera trace is being recorded (saved from on_present when complete)
+	std::string g_trace_status;        // shown next to the record button
+	bool g_trace_request = false;      // the button was clicked: started on the present thread (motion runs there)
 	// pixel shaders drawn on the world target in the air stage, with counts: this frame (building) and last frame
 	struct air_draw { uint32_t ps; int count; };
 	constexpr int AIR_DRAW_SLOTS = 12;
@@ -516,6 +525,10 @@ namespace
 			reshade::get_config_value(nullptr, CONFIG_SECTION, "AltModeIconsBeforeSplit", g_air_icons_first);
 			reshade::get_config_value(nullptr, CONFIG_SECTION, "WideMoverSearch", g_wide_search);
 			reshade::get_config_value(nullptr, CONFIG_SECTION, "FloorFollowsCamera", g_floor_camera);
+			reshade::get_config_value(nullptr, CONFIG_SECTION, "CameraFromSprites", g_sprite_camera);
+			reshade::get_config_value(nullptr, CONFIG_SECTION, "IconDepthOfBuilding", g_icon_depth_flat);
+			reshade::get_config_value(nullptr, CONFIG_SECTION, "MeasureMotionFit", g_fit_measure);
+			reshade::get_config_value(nullptr, CONFIG_SECTION, "IconMotionFromSprites2", g_icon_motion);
 			g_layer_ground_occ = std::max(g_layer_ground_occ, 1);
 			// Earlier defaults: BCD79626 (0.10.x, that is the floor stage) and 7C158CCA #2 (0.11.0, includes decoratives)
 			if (g_layer_ground_ps == LAYER_FLOOR_AFTER_PS || (g_layer_ground_ps == LAYER_GROUND_AFTER_PS && g_layer_ground_occ == 2))
@@ -645,6 +658,10 @@ namespace
 			reshade::set_config_value(nullptr, CONFIG_SECTION, "AltModeIconsBeforeSplit", g_air_icons_first);
 			reshade::set_config_value(nullptr, CONFIG_SECTION, "WideMoverSearch", g_wide_search);
 			reshade::set_config_value(nullptr, CONFIG_SECTION, "FloorFollowsCamera", g_floor_camera);
+			reshade::set_config_value(nullptr, CONFIG_SECTION, "CameraFromSprites", g_sprite_camera);
+			reshade::set_config_value(nullptr, CONFIG_SECTION, "IconDepthOfBuilding", g_icon_depth_flat);
+			reshade::set_config_value(nullptr, CONFIG_SECTION, "MeasureMotionFit", g_fit_measure);
+			reshade::set_config_value(nullptr, CONFIG_SECTION, "IconMotionFromSprites2", g_icon_motion);
 		}
 		{
 			char buf[32];
@@ -1001,6 +1018,31 @@ namespace
 		options.motion_icons_first = g_air_icons_first;
 		options.motion_wide_search = g_wide_search;
 		options.motion_floor_camera = g_floor_camera;
+		{
+			// 1.3: this frame's camera shift from the sprites (sprite_mask::frame_end ran just before)
+			const sprite_mask::camera_info ci = g_sprite_mask ? sprite_mask::camera() : sprite_mask::camera_info{};
+			options.motion_sprite_camera = g_sprite_camera;
+			options.motion_icon_depth_flat = g_icon_depth_flat;
+			options.motion_fit_measure = g_fit_measure;
+			options.sprite_camera_support = ci.support;
+			options.sprite_camera_tight = ci.tight;
+			options.motion_icon_motion = g_icon_motion;
+			// the air stage (alt-mode icons, bots): its most common shift, when most of its sprites share it
+			const sprite_mask::camera_info::stage_shift &air = ci.stage[3];
+			options.icon_shift_valid = ci.exact && air.n >= 8 && air.share >= 0.5f;
+			options.icon_dx = ci.dx + air.dx;
+			options.icon_dy = ci.dy + air.dy;
+			for (int s = 1; s <= 3; ++s)
+			{
+				options.stage_diag[(s - 1) * 4 + 0] = static_cast<float>(ci.stage[s].n);
+				options.stage_diag[(s - 1) * 4 + 1] = ci.stage[s].dx;
+				options.stage_diag[(s - 1) * 4 + 2] = ci.stage[s].dy;
+				options.stage_diag[(s - 1) * 4 + 3] = ci.stage[s].share;
+			}
+			options.sprite_camera_valid = ci.exact;
+			options.sprite_camera_dx = ci.dx;
+			options.sprite_camera_dy = ci.dy;
+		}
 		options.scene_cut_detection = g_scene_cut;
 		options.scene_cut_factor = g_scene_cut_factor;
 		ID3D11Texture2D *layer_textures[bridge::LAYER_COUNT] = {};
@@ -1932,6 +1974,7 @@ namespace
 			sprite_mask::set_dump_dir(g_dev_tools ? output_dir().c_str() : L"");
 		}
 		sprite_mask::set_enabled(g_sprite_mask);
+		sprite_mask::set_stage_shifts(g_icon_motion || g_trace_waiting);
 		sprite_mask::frame_end(reinterpret_cast<ID3D11Device *>(g_device->get_native()), reinterpret_cast<ID3D11DeviceContext *>(queue->get_native()),
 			reinterpret_cast<ID3D11Texture2D *>(native_back_buffer(sc).handle), g_bb_desc.texture.width, g_bb_desc.texture.height, g_sprite_mask && g_sprite_overlay);
 
@@ -2021,6 +2064,55 @@ namespace
 		return true;
 	}
 
+	// 1.3 beta 7: a finished camera trace is written here, on the present thread, every frame it is pending - beta 4-6
+	// only wrote it while the Motion vectors tab was drawn, so a trace finished with the overlay closed (or another tab
+	// open) was never saved, and each one overwrote the last. Now numbered: camera_trace_N.csv.
+	void save_camera_trace()
+	{
+		std::lock_guard<app_mutex> lock(g_mutex);
+		if (!g_trace_waiting)
+			return;
+		if (g_trace_request)
+		{
+			g_trace_request = false;
+			if (!bridge::camera_trace_start(300))
+			{
+				g_trace_waiting = false;
+				g_trace_status = "frame generation is not running: nothing to record";
+			}
+			return;
+		}
+		std::string text;
+		if (!bridge::camera_trace_take(text))
+		{
+			if (!bridge::active())
+			{
+				g_trace_waiting = false;
+				g_trace_status = "frame generation stopped before the recording was complete";
+			}
+			return;
+		}
+		g_trace_waiting = false;
+		std::error_code ec;
+		std::filesystem::create_directories(output_dir(), ec);
+		std::filesystem::path path;
+		for (int n = 1; n < 1000; ++n)
+		{
+			path = output_dir() / (L"camera_trace_" + std::to_wstring(n) + L".csv");
+			if (!std::filesystem::exists(path, ec))
+				break;
+		}
+		if (FILE *f = _wfopen(path.c_str(), L"w"))
+		{
+			std::fwrite(text.data(), 1, text.size(), f);
+			std::fclose(f);
+			g_trace_status = "saved to " + path.u8string();
+			log_info("HUD-less probe: camera trace saved to %s", path.u8string().c_str());
+		}
+		else
+			g_trace_status = "could not create " + path.u8string();
+	}
+
 	void on_present(command_queue *queue, swapchain *sc, const rect *, const rect *, uint32_t, const rect *)
 	{
 		// Device check first: this event also fires for the bridge's own D3D12 swap chain, from inside bridge::present.
@@ -2040,6 +2132,7 @@ namespace
 		// The bridge runs outside the lock: its D3D12 calls make ReShade raise events into this add-on.
 		bridge_frame(queue, sc);
 		QueryPerformanceCounter(&t2);
+		save_camera_trace();
 
 		// Stutter monitor: this frame's interval with the work at the last present and this frame's draw-time costs.
 		const sprite_mask::frame_costs mc = sprite_mask::last_costs();
@@ -2146,6 +2239,22 @@ namespace
 			ImGui::Text("%s %ux%s | Factorio %.0f fps -> %.0f fps | v" ADDON_VERSION_SHOWN, bridge::backend_name(), shown, g_fg_multiplier == 0 ? " auto" : "",
 				g_base_fps, g_base_fps * (shown != 0 ? shown : 1));
 			ImGui::Text("Camera %+5.1f %+5.1f px | zoom %.3f | match %3.0f%% | MV %s", dx, dy, bridge::motion_zoom(), conf * 100.0f, g_motion_vectors ? "on" : "off");
+			ImGui::Text("Camera source: %s", bridge::camera_line());
+			if (shown > 1 && (std::fabs(dx) >= 0.5f || std::fabs(dy) >= 0.5f))
+			{
+				// 1.3 beta 9: where the generated frames put the world: whole pixels stay crisp, fractions get resampled
+				char pos[160];
+				int n = std::snprintf(pos, sizeof(pos), "In-between positions (%ux):", shown);
+				bool whole = true;
+				for (uint32_t k = 1; k < shown && n > 0 && n < static_cast<int>(sizeof(pos)); ++k)
+				{
+					const float px = dx * static_cast<float>(k) / static_cast<float>(shown), py = dy * static_cast<float>(k) / static_cast<float>(shown);
+					whole = whole && std::fabs(px - std::round(px)) < 0.05f && std::fabs(py - std::round(py)) < 0.05f;
+					n += std::snprintf(pos + n, sizeof(pos) - n, " %+.2f %+.2f", px, py);
+				}
+				ImGui::Text("%s px -> %s", pos, whole ? "whole pixels (crisp)" : "between pixels (resampled)");
+			}
+			ImGui::Text("%s", bridge::fit_line());
 			if (has_notice)
 				ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s", notice);
 			{
@@ -2347,41 +2456,36 @@ namespace
 			else
 				ImGui::Text("Factorio %.1f fps", g_base_fps);
 
-			ImGui::Separator();
-			ImGui::TextWrapped("%s: %s", bridge::backend_name(), bridge::fg_status());
-			if (bridge::max_multiplier() < 4 && bridge::active())
-				ImGui::TextDisabled("  %s generates one frame per Factorio frame: 2x at most.", bridge::backend_name());
+			ImGui::TextDisabled("The frame-generated picture is hidden while this overlay is open. Close the overlay (Home) to see it.");
+			if (const char *warning = capture_warning())
+				ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "%s", warning);
+
+			ImGui::SeparatorText("Character");
 			ImGui::TextUnformatted("Character in generated frames:");
 			ImGui::SameLine();
 			if (ImGui::RadioButton("laid over##charmode", g_fsr_hold)) { g_fsr_hold = true; changed = true; }
 			ImGui::SameLine();
 			if (ImGui::RadioButton("generated##charmode", !g_fsr_hold)) { g_fsr_hold = false; changed = true; }
 			ImGui::TextDisabled("  Laid over: the character from the newest Factorio frame, like the GUI - always sharp, its animation steps at Factorio's frame rate.\n"
-				"  Generated: frame generation interpolates it too, with its own motion (with the exact mask: it stays put on screen) - smoother, may blend two animation poses.");
+				"  Generated: frame generation interpolates it too, with its own motion - smoother, may blend two animation poses.");
 			ImGui::BeginDisabled(!g_fsr_hold);
-			changed |= ImGui::Checkbox("  ...and remove it from what frame generation blends", &g_fsr_inpaint);
+			changed |= ImGui::Checkbox("...and remove it from what frame generation blends", &g_fsr_inpaint);
 			ImGui::EndDisabled();
-			ImGui::TextDisabled("    Frame generation gets what is under the character (from the world snapshots) instead of the character, moving with the world: no copies of it, and much less noise where the ground behind it is uncovered.");
-			if (!fsr_running && bridge::active())
-				ImGui::TextDisabled("    DLSS-G: uses its UI recomposition; if this DLSS-G does not offer it, the DLSS-G line above shows no \"UI layer\" and these have no effect.");
-			ImGui::TextWrapped("Bridge: %s%s", bridge::status(), g_bridge_failed ? " (init failed, see ReShade.log)" : "");
-			if (bridge::active())
-			{
-				const bridge::timings t = bridge::get_timings();
-				ImGui::Text("GPU motion passes %.2f ms (camera %.2f, blocks %.2f, rest %.2f) | scene-cut check wait %.2f ms | bridge CPU %.2f ms",
-					t.motion_gpu_ms, t.motion_camera_ms, t.motion_block_ms, t.motion_rest_ms, t.cut_wait_ms, t.present_cpu_ms);
-			}
-			ImGui::Separator();
+			ImGui::TextDisabled("  Frame generation gets what is under the character (from the world snapshots) instead of the character, moving with the world.");
+
+			ImGui::SeparatorText("Scene cuts");
 			changed |= ImGui::Checkbox("Scene-cut detection (map open/close, surface change, teleport)", &g_scene_cut);
 			if (g_scene_cut)
 			{
 				changed |= ImGui::SliderFloat("Scene-cut factor", &g_scene_cut_factor, 1.5f, 20.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
 				ImGui::TextDisabled("  A cut is a frame this many times more different than usual. Lower: more sensitive.");
 				const bridge::timings t = bridge::get_timings();
-				ImGui::Text("  Frame difference %.3f (usual %.3f) | cuts detected: %u", t.difference, t.difference_average, t.scene_cuts);
+				ImGui::TextDisabled("  Frame difference %.3f (usual %.3f) | cuts detected: %u", t.difference, t.difference_average, t.scene_cuts);
 			}
-			ImGui::Separator();
+
+			ImGui::SeparatorText("Display and overlays");
 			changed |= ImGui::Checkbox("Tearing / VRR present (sync interval 0)", &g_bridge_tearing);
+			ImGui::TextDisabled("  Leave on with G-Sync / FreeSync.");
 			changed |= ImGui::Checkbox("On-screen readout (top left of the game picture)", &g_osd);
 			ImGui::SameLine();
 			if (g_osd_key_capture)
@@ -2403,18 +2507,31 @@ namespace
 				char line[256];
 				steam_overlay::status(line, sizeof(line));
 				ImGui::TextDisabled("  %s", line);
+			}
+
+			ImGui::SeparatorText("Status");
+			ImGui::TextWrapped("%s: %s", bridge::backend_name(), bridge::fg_status());
+			if (bridge::max_multiplier() < 4 && bridge::active())
+				ImGui::TextDisabled("  %s generates one frame per Factorio frame: 2x at most.", bridge::backend_name());
+			if (!fsr_running && bridge::active())
+				ImGui::TextDisabled("  DLSS-G lays the GUI and character over with its UI recomposition; without it (no \"UI layer\" above) they are generated.");
+			ImGui::TextWrapped("Bridge: %s%s", bridge::status(), g_bridge_failed ? " (init failed, see ReShade.log)" : "");
+			if (bridge::active())
+			{
+				const bridge::timings t = bridge::get_timings();
+				ImGui::TextDisabled("  GPU motion passes %.2f ms (camera %.2f, blocks %.2f, rest %.2f) | scene-cut check wait %.2f ms | bridge CPU %.2f ms",
+					t.motion_gpu_ms, t.motion_camera_ms, t.motion_block_ms, t.motion_rest_ms, t.cut_wait_ms, t.present_cpu_ms);
+			}
+			{
+				char line[320];
 				stutter::readout(line, sizeof(line));
 				ImGui::TextDisabled("  %s", line);
 				ImGui::TextDisabled("  (each stutter is logged with what took the time: ReShade.log and hudless_probe\\stutters.txt)");
 			}
 			if (changed)
 				save_config();
-			ImGui::TextDisabled("The frame-generated picture is hidden while this overlay is open. Close the overlay (Home) to see it.");
 
-			if (const char *warning = capture_warning())
-				ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "%s", warning);
-
-			ImGui::Separator();
+			ImGui::SeparatorText("Setup");
 			const int problems = setup::problems();
 			if (ImGui::CollapsingHeader(problems > 0 ? "Setup check (problems found)###setup" : "Setup check###setup", problems > 0 ? ImGuiTreeNodeFlags_DefaultOpen : 0))
 			{
@@ -2429,7 +2546,7 @@ namespace
 				if (ImGui::Button("Check again"))
 					setup::run(g_module);
 			}
-			if (ImGui::Checkbox("Show developer tools (capture rule editor, frame trace, camera probe)", &g_dev_tools))
+			if (ImGui::Checkbox("Show developer tools (capture rule editor, frame trace, recordings)", &g_dev_tools))
 				save_config();
 			ImGui::PopItemWidth();
 			ImGui::EndTabItem();
@@ -2438,64 +2555,23 @@ namespace
 		if (ImGui::BeginTabItem("Motion vectors", nullptr, 0))
 		{
 			ImGui::PushItemWidth(-ImGui::GetFontSize() * 13.0f);
-			if (ImGui::CollapsingHeader("Character tracking (from Factorio's sprites)", ImGuiTreeNodeFlags_DefaultOpen))
+			bool changed = false;
+
+			// What frame generation is given right now (read-only)
+			ImGui::SeparatorText("Status");
+			ImGui::TextWrapped("Motion: %s", bridge::active() ? bridge::motion_status() : "frame generation is off");
+			if (bridge::active())
 			{
-				if (ImGui::Checkbox("Build the character mask from Factorio's sprites", &g_sprite_mask))
-					save_config();
-				ImGui::SameLine();
-				ImGui::BeginDisabled(!g_sprite_mask);
-				ImGui::Checkbox("Show it (red: character, blue: its shadow)", &g_sprite_overlay);
-				ImGui::EndDisabled();
-				ImGui::TextWrapped("Mask: %s", g_sprite_mask ? sprite_mask::status() : "off");
-				if (g_dev_tools)
-				{
-					if (ImGui::Button("Write what is near the centre now##maskdump"))
-						sprite_mask::dump_now();
-					ImGui::SameLine();
-					ImGui::TextDisabled("(also written automatically when the character is lost: hudless_probe\\sprite_mask_N.txt)");
-				}
-				ImGui::BeginDisabled(!g_sprite_mask);
-				if (ImGui::Checkbox("Use it for frame generation (instead of guessing the character from its motion)", &g_mask_fg))
-					save_config();
-				ImGui::EndDisabled();
-				ImGui::TextDisabled("Frame generation: %s", !bridge::active() ? "not running" :
-					bridge::exact_mask_used() ? "uses the exact mask (character and shadow stay put on screen, nothing else is held)" :
-					"guesses the character from its motion (as in 1.1)");
-				ImGui::BeginDisabled(!g_sprite_mask || !g_mask_fg);
-				if (ImGui::Checkbox("Lay its shadow over as a darkening (the ground under it moves with the world)", &g_shadow_overlay))
-					save_config();
-				ImGui::EndDisabled();
-				{
-					char line[256];
-					shadow_line(line, sizeof(line));
-					ImGui::TextDisabled("%s", line);
-					ImGui::TextDisabled("  (darkness per mask coverage, measured while the camera moves; \"?\" not yet, samples last frame in brackets.\n"
-						"  On objects ~0 means they are drawn over the shadow and are not darkened)");
-				}
-				ImGui::Separator();
+				ImGui::TextDisabled("  Camera source: %s", bridge::camera_line());
+				if (g_fit_measure)
+					ImGui::TextDisabled("  %s", bridge::fit_line());
+				ImGui::TextDisabled("  Depth: %s", bridge::depth_status());
 			}
-			if (g_dev_tools && ImGui::CollapsingHeader("Sprite probe (1.2 step 0)", 0))
-			{
-				ImGui::TextWrapped("Records how Factorio sends its sprites to the GPU, for 6 seconds. Click Record, close this overlay and keep "
-					"running around (change direction a few times). Nothing changes in the picture; a short stutter every half second is "
-					"expected. Then send ReShade.log and the file named below.");
-				if (sprite_probe::active())
-					ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "Recording...");
-				else if (ImGui::Button("Record 6 s##sprite"))
-				{
-					static int run = 0;
-					wchar_t name[64];
-					std::swprintf(name, 64, L"sprite_probe_%d.txt", ++run);
-					sprite_probe::start(output_dir() / name, 360);
-				}
-				ImGui::SameLine();
-				ImGui::TextWrapped("Status: %s", sprite_probe::status());
-				ImGui::Separator();
-			}
-			bool changed = ImGui::Checkbox("Motion vectors (estimated from the image)", &g_motion_vectors);
-			ImGui::SameLine();
-			changed |= ImGui::Checkbox("Flip sign (diagnostic)", &g_motion_flip);
-			ImGui::Text("Motion: %s", bridge::active() ? bridge::motion_status() : "frame generation is off");
+
+			// The main switches
+			ImGui::SeparatorText("Motion vectors");
+			changed |= ImGui::Checkbox("Motion vectors", &g_motion_vectors);
+			ImGui::TextDisabled("  How everything moved between Factorio's frames. Off: frame generation guesses on its own (for comparison).");
 			changed |= ImGui::Checkbox("World layers (ground / floor / objects / air)", &g_world_layers);
 			ImGui::SameLine();
 			if (!g_world_layers)
@@ -2514,7 +2590,7 @@ namespace
 				ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "  Snapshot points found from the frame structure (the built-in shaders are not drawn: Factorio "
 					"update?): ground PS %08X #%d, floor %08X, clouds %08X, composite %08X.", g_act_ground_ps, g_act_ground_occ,
 					g_act_has_floor ? g_act_floor_ps : 0u, g_act_has_cloud ? g_act_cloud_ps : 0u, g_act_world_ps);
-			else
+			else if (g_dev_tools)
 			{
 				const bool match = g_learned.valid && g_learned.ground_ps == g_layer_ground_ps && g_learned.ground_occ == g_layer_ground_occ &&
 					(!g_learned.has_floor || g_learned.floor_ps == LAYER_FLOOR_AFTER_PS) && (!g_learned.has_cloud || g_learned.cloud_ps == LAYER_ENTITIES_BEFORE_PS) &&
@@ -2522,127 +2598,215 @@ namespace
 				ImGui::TextDisabled("  Snapshot points: built-in (ground after PS %08X occurrence %d). Structure check: %s", g_layer_ground_ps, g_layer_ground_occ,
 					!g_learned.valid ? "not run yet" : (match ? "finds the same points" : "finds different points (only used if the built-in ones disappear)"));
 			}
-			// Air split: icons on one side (camera motion), flying robots on the other (motion search). Collapsed, and
-			// the shader choice in a combo box, so the air stage's changing draws do not move the settings below.
+			changed |= ImGui::Checkbox("Camera from Factorio's sprites", &g_sprite_camera);
+			ImGui::TextDisabled("  The camera's shift read off the exact positions of the sprites Factorio draws (not while zooming, needs Character\n"
+				"  tracking); otherwise it is fitted to the picture.");
+			changed |= ImGui::Checkbox("Belts and other floor: own motion only where it is certain", &g_floor_camera);
+			ImGui::TextDisabled("  Belts, rails, pipes, grass move with the world unless a belt's motion is unambiguous (items and surface slide).\n"
+				"  Off: as before 1.2.");
+
+			// The character
+			if (ImGui::CollapsingHeader("Character tracking (from Factorio's sprites)", ImGuiTreeNodeFlags_DefaultOpen))
 			{
-				// shaders seen in the air stage (kept, so the list does not change from frame to frame)
-				for (int k = 0; k < g_air_draw_count_last; ++k)
+				if (ImGui::Checkbox("Build the character mask from Factorio's sprites", &g_sprite_mask))
+					save_config();
+				ImGui::SameLine();
+				ImGui::BeginDisabled(!g_sprite_mask);
+				ImGui::Checkbox("Show it (red: character, blue: its shadow)", &g_sprite_overlay);
+				ImGui::EndDisabled();
+				ImGui::TextWrapped("Mask: %s", g_sprite_mask ? sprite_mask::status() : "off");
+				ImGui::BeginDisabled(!g_sprite_mask);
+				if (ImGui::Checkbox("Use it for frame generation (instead of guessing the character from its motion)", &g_mask_fg))
+					save_config();
+				ImGui::EndDisabled();
+				ImGui::TextDisabled("  Frame generation: %s", !bridge::active() ? "not running" :
+					bridge::exact_mask_used() ? "uses the exact mask (character and shadow stay put on screen, nothing else is held)" :
+					"guesses the character from its motion (as in 1.1)");
+				ImGui::BeginDisabled(!g_sprite_mask || !g_mask_fg);
+				if (ImGui::Checkbox("Lay its shadow over as a darkening (the ground under it moves with the world)", &g_shadow_overlay))
+					save_config();
+				ImGui::EndDisabled();
 				{
-					int j = 0;
-					while (j < g_air_seen_count && g_air_seen[j].ps != g_air_draws_last[k].ps)
-						++j;
-					if (j < g_air_seen_count)
-						g_air_seen[j].count = g_air_draws_last[k].count;
-					else if (g_air_seen_count < AIR_SEEN_SLOTS)
-						g_air_seen[g_air_seen_count++] = g_air_draws_last[k];
+					char line[256];
+					shadow_line(line, sizeof(line));
+					ImGui::TextDisabled("  %s", line);
+					ImGui::TextDisabled("  (darkness per mask coverage, measured while the camera moves; \"?\" not yet, samples last frame in brackets;\n"
+						"  on objects ~0 means they are drawn over the shadow and are not darkened)");
 				}
-				char header[96];
-				std::snprintf(header, sizeof(header), "Air split: alt-mode icons / flying robots (split before PS %08X%s)###airsplit", g_air_split_ps,
-					g_air_split_ps == DEFAULT_AIR_SPLIT_PS ? ", default" : "");
-				if (ImGui::CollapsingHeader(header, 0))
+			}
+
+			// Things that move on their own
+			if (ImGui::CollapsingHeader("Trains, cars, bots", 0))
+			{
+				changed |= ImGui::Checkbox("Mover search", &g_mover_search);
+				ImGui::TextDisabled("  Finds trains, cars, bots by searching each block; off = only follow motion found earlier, as before 0.9.");
+				changed |= ImGui::Checkbox("Wide search for fast movers", &g_wide_search);
+				ImGui::TextDisabled("  Up to 192 px per frame instead of 48, where the normal search finds nothing: fast trains.");
+			}
+
+			// Alt-mode icons
+			if (ImGui::CollapsingHeader("Alt-mode icons", 0))
+			{
+				changed |= ImGui::Checkbox("Depth of the building under them", &g_icon_depth_flat);
+				ImGui::TextDisabled("  No depth edge around every icon. Off: icons nearer than buildings, as in 1.2.");
+				changed |= ImGui::Checkbox("Motion from their own sprites (for mods)", &g_icon_motion);
+				ImGui::TextDisabled("  In vanilla they move exactly with the world, so this changes nothing there; for mods that place icons on\n"
+					"  their own. Costs about 0.7 ms per frame on Factorio's thread while on.");
+				// Air split: icons on one side (camera motion), flying robots on the other (motion search). Collapsed, and
+				// the shader choice in a combo box, so the air stage's changing draws do not move the settings below.
 				{
-					ImGui::TextDisabled("Check in Debug view > World layers: alt-mode icons cyan, flying robots yellow. The wrong way round: flip the "
-						"checkbox. Both one colour: split before another shader of the air stage.");
-					changed |= ImGui::Checkbox("Alt-mode icons are drawn before the split", &g_air_icons_first);
-					char preview[48];
-					std::snprintf(preview, sizeof(preview), "%08X%s", g_air_split_ps, g_air_split_ps == DEFAULT_AIR_SPLIT_PS ? " (default)" : "");
-					if (ImGui::BeginCombo("Split before shader##air", preview, 0))
+					// shaders seen in the air stage (kept, so the list does not change from frame to frame)
+					for (int k = 0; k < g_air_draw_count_last; ++k)
 					{
-						if (ImGui::Selectable("D82AC825 (default)##airdef", g_air_split_ps == DEFAULT_AIR_SPLIT_PS, 0, ImVec2(0, 0)))
+						int j = 0;
+						while (j < g_air_seen_count && g_air_seen[j].ps != g_air_draws_last[k].ps)
+							++j;
+						if (j < g_air_seen_count)
+							g_air_seen[j].count = g_air_draws_last[k].count;
+						else if (g_air_seen_count < AIR_SEEN_SLOTS)
+							g_air_seen[g_air_seen_count++] = g_air_draws_last[k];
+					}
+					char header[96];
+					std::snprintf(header, sizeof(header), "Air split: alt-mode icons / flying robots (split before PS %08X%s)###airsplit", g_air_split_ps,
+						g_air_split_ps == DEFAULT_AIR_SPLIT_PS ? ", default" : "");
+					if (ImGui::CollapsingHeader(header, 0))
+					{
+						ImGui::TextDisabled("Check in Debug view > World layers: alt-mode icons cyan, flying robots yellow. The wrong way round: flip the "
+							"checkbox. Both one colour: split before another shader of the air stage.");
+						changed |= ImGui::Checkbox("Alt-mode icons are drawn before the split", &g_air_icons_first);
+						char preview[48];
+						std::snprintf(preview, sizeof(preview), "%08X%s", g_air_split_ps, g_air_split_ps == DEFAULT_AIR_SPLIT_PS ? " (default)" : "");
+						if (ImGui::BeginCombo("Split before shader##air", preview, 0))
 						{
-							g_air_split_ps = DEFAULT_AIR_SPLIT_PS;
-							changed = true;
-						}
-						for (int k = 0; k < g_air_seen_count; ++k)
-						{
-							bool now = false;
-							for (int j = 0; j < g_air_draw_count_last; ++j)
-								now = now || g_air_draws_last[j].ps == g_air_seen[k].ps;
-							char label[64];
-							std::snprintf(label, sizeof(label), "%08X  (%d draws last frame)##air%d", g_air_seen[k].ps, now ? g_air_seen[k].count : 0, k);
-							if (ImGui::Selectable(label, g_air_split_ps == g_air_seen[k].ps, 0, ImVec2(0, 0)))
+							if (ImGui::Selectable("D82AC825 (default)##airdef", g_air_split_ps == DEFAULT_AIR_SPLIT_PS, 0, ImVec2(0, 0)))
 							{
-								g_air_split_ps = g_air_seen[k].ps;
+								g_air_split_ps = DEFAULT_AIR_SPLIT_PS;
 								changed = true;
 							}
+							for (int k = 0; k < g_air_seen_count; ++k)
+							{
+								bool now = false;
+								for (int j = 0; j < g_air_draw_count_last; ++j)
+									now = now || g_air_draws_last[j].ps == g_air_seen[k].ps;
+								char label[64];
+								std::snprintf(label, sizeof(label), "%08X  (%d draws last frame)##air%d", g_air_seen[k].ps, now ? g_air_seen[k].count : 0, k);
+								if (ImGui::Selectable(label, g_air_split_ps == g_air_seen[k].ps, 0, ImVec2(0, 0)))
+								{
+									g_air_split_ps = g_air_seen[k].ps;
+									changed = true;
+								}
+							}
+							ImGui::EndCombo();
 						}
-						ImGui::EndCombo();
 					}
 				}
 			}
-			changed |= ImGui::Checkbox("Mover search", &g_mover_search);
-			ImGui::TextDisabled("  Finds trains, cars, bots by searching each block; off = only follow motion found earlier, as before 0.9.");
-			changed |= ImGui::Checkbox("Wide search for fast movers", &g_wide_search);
-			ImGui::TextDisabled("  Up to 192 px per frame instead of 48, where the normal search finds nothing: fast trains.");
-			changed |= ImGui::Checkbox("Belts and other floor: own motion only where it is certain", &g_floor_camera);
-			ImGui::TextDisabled("  Belts, rails, pipes, grass move with the world unless a belt's motion is unambiguous there (items and surface\n"
-				"  slide); a repeating empty belt surface or two belts in opposite directions no longer stick or blur. Off: as before 1.2.");
-			ImGui::TextDisabled("  Depth for DLSS-G comes from the world layers. %s", bridge::depth_status());
+
 			if (ImGui::CollapsingHeader("Fine tuning", 0))
 			{
-			changed |= ImGui::SliderFloat("Zero-motion penalty", &g_motion_penalty_zero, 0.0f, 2.0f, "%.2f", 0);
-			ImGui::TextDisabled("  Higher: the character must match 'still' more clearly before it gets zero motion.");
-			changed |= ImGui::SliderFloat("No-match threshold", &g_motion_mismatch, 0.1f, 32.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-			ImGui::TextDisabled("  Lower: more blocks fall back to camera motion.");
-			changed |= ImGui::SliderFloat("Stability", &g_motion_hysteresis, 0.0f, 2.0f, "%.2f", 0);
-			ImGui::TextDisabled("  Higher: blocks keep last frame's kind of motion (camera / still / own) more stubbornly. Less shimmer; too high and moving things lag behind.");
-			changed |= ImGui::SliderFloat("Own-motion strictness", &g_motion_strictness, 0.0f, 0.95f, "%.2f", 0);
-			ImGui::TextDisabled("  New own motion must match this much better than the camera (0.5 = half the difference). Higher: animations (water, trees, smoke, machines) stop getting bogus motion; too high and things that start moving are picked up a frame or two later.");
-			changed |= ImGui::SliderFloat("Repeating-pattern guard", &g_motion_far_penalty, 0.0f, 0.3f, "%.3f", 0);
-			ImGui::TextDisabled("  Own motion pays this per pixel it differs from the camera. On repeating patterns (module rows, belts, assembler grids) a shift by one repeat matches as well as the right answer; higher stops those ghost copies. Too high and fast trains or cars fall back to the camera.");
-			changed |= ImGui::SliderFloat("Still zone", &g_motion_still_zone, 0.05f, 1.2f, "%.2f", 0);
-			ImGui::TextDisabled("  Radius around the screen centre (in screen heights) where things may be 'still': the character or vehicle the camera follows. Outside it, identical things that moved exactly one spacing (module icons, belt items) can not be mistaken for still. Shown as a circle in the debug view.");
-			if (ImGui::Button("Reset to defaults"))
-			{
-				g_motion_penalty_zero = DEFAULT_MOTION_PENALTY_ZERO;
-				g_motion_mismatch = DEFAULT_MOTION_MISMATCH;
-				g_motion_hysteresis = DEFAULT_MOTION_HYSTERESIS;
-				g_motion_strictness = DEFAULT_MOTION_STRICTNESS;
-				g_motion_far_penalty = DEFAULT_MOTION_FAR_PENALTY;
-				g_motion_still_zone = DEFAULT_MOTION_STILL_ZONE;
-				changed = true;
-			}
-			ImGui::SameLine();
-			ImGui::TextDisabled("(%.2f / %.2f / %.2f / %.2f / %.3f / %.2f)", DEFAULT_MOTION_PENALTY_ZERO, DEFAULT_MOTION_MISMATCH, DEFAULT_MOTION_HYSTERESIS,
-				DEFAULT_MOTION_STRICTNESS, DEFAULT_MOTION_FAR_PENALTY, DEFAULT_MOTION_STILL_ZONE);
+				changed |= ImGui::SliderFloat("Zero-motion penalty", &g_motion_penalty_zero, 0.0f, 2.0f, "%.2f", 0);
+				ImGui::TextDisabled("  Higher: the character must match 'still' more clearly before it gets zero motion.");
+				changed |= ImGui::SliderFloat("No-match threshold", &g_motion_mismatch, 0.1f, 32.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+				ImGui::TextDisabled("  Lower: more blocks fall back to camera motion.");
+				changed |= ImGui::SliderFloat("Stability", &g_motion_hysteresis, 0.0f, 2.0f, "%.2f", 0);
+				ImGui::TextDisabled("  Higher: blocks keep last frame's kind of motion (camera / still / own) more stubbornly. Less shimmer; too high and moving things lag behind.");
+				changed |= ImGui::SliderFloat("Own-motion strictness", &g_motion_strictness, 0.0f, 0.95f, "%.2f", 0);
+				ImGui::TextDisabled("  New own motion must match this much better than the camera (0.5 = half the difference). Higher: animations (water, trees, smoke, machines) stop getting bogus motion; too high and things that start moving are picked up a frame or two later.");
+				changed |= ImGui::SliderFloat("Repeating-pattern guard", &g_motion_far_penalty, 0.0f, 0.3f, "%.3f", 0);
+				ImGui::TextDisabled("  Own motion pays this per pixel it differs from the camera. On repeating patterns (module rows, belts, assembler grids) a shift by one repeat matches as well as the right answer; higher stops those ghost copies. Too high and fast trains or cars fall back to the camera.");
+				changed |= ImGui::SliderFloat("Still zone", &g_motion_still_zone, 0.05f, 1.2f, "%.2f", 0);
+				ImGui::TextDisabled("  Without character tracking only: radius around the screen centre (in screen heights) where things may be 'still': the character or vehicle the camera follows. Outside it, identical things that moved exactly one spacing (module icons, belt items) can not be mistaken for still. Shown as a circle in the debug view.");
+				if (ImGui::Button("Reset to defaults"))
+				{
+					g_motion_penalty_zero = DEFAULT_MOTION_PENALTY_ZERO;
+					g_motion_mismatch = DEFAULT_MOTION_MISMATCH;
+					g_motion_hysteresis = DEFAULT_MOTION_HYSTERESIS;
+					g_motion_strictness = DEFAULT_MOTION_STRICTNESS;
+					g_motion_far_penalty = DEFAULT_MOTION_FAR_PENALTY;
+					g_motion_still_zone = DEFAULT_MOTION_STILL_ZONE;
+					changed = true;
+				}
+				ImGui::SameLine();
+				ImGui::TextDisabled("(%.2f / %.2f / %.2f / %.2f / %.3f / %.2f)", DEFAULT_MOTION_PENALTY_ZERO, DEFAULT_MOTION_MISMATCH, DEFAULT_MOTION_HYSTERESIS,
+					DEFAULT_MOTION_STRICTNESS, DEFAULT_MOTION_FAR_PENALTY, DEFAULT_MOTION_STILL_ZONE);
 			}
 			if (ImGui::CollapsingHeader(g_motion_debug || g_fsr_debug || g_fsr_ui_layer || g_fsr_only_generated ? "Debug views (ON)###dbg" : "Debug views###dbg", 0))
 			{
-			ImGui::Checkbox("Debug view (replaces the game picture; frame generation pauses so you see exactly this frame)", &g_motion_debug);
-			ImGui::RadioButton("Motion kinds", &g_debug_mode, 0);
-			ImGui::SameLine();
-			ImGui::RadioButton("World layers / depth", &g_debug_mode, 1);
-			ImGui::TextUnformatted("Snapshots:");
-			ImGui::SameLine();
-			ImGui::RadioButton("Ground", &g_debug_mode, 2);
-			ImGui::SameLine();
-			ImGui::RadioButton("Floor", &g_debug_mode, 3);
-			ImGui::SameLine();
-			ImGui::RadioButton("Entities", &g_debug_mode, 4);
-			ImGui::SameLine();
-			ImGui::RadioButton("World with air", &g_debug_mode, 5);
-			ImGui::SameLine();
-			ImGui::RadioButton("Air split", &g_debug_mode, 6);
-			ImGui::TextDisabled("  World layers: dark = ground (far, always camera motion), blue = floor: belts, pipes, shadows, white = objects: buildings, character, vehicles, cyan = alt-mode icons (camera motion unless that clearly does not match), yellow = flying: robots, effects (nearest).");
-			ImGui::TextDisabled("  No tint: moves with the camera. Blue: still (the character). Other colours: own motion, colour = direction. Tints that flicker on things that do not move are what shimmers. Close the overlay to see it. Not saved: off after a restart.");
-			{
-				float cam = 0, still = 0, own = 0;
-				bridge::motion_shares(cam, still, own);
-				ImGui::Text("Blocks: camera %.0f%% | still %.0f%% | own motion %.0f%%", cam * 100.0f, still * 100.0f, own * 100.0f);
+				ImGui::Checkbox("Debug view (replaces the game picture; frame generation pauses so you see exactly this frame)", &g_motion_debug);
+				changed |= ImGui::Checkbox("Flip the motion vectors' sign (diagnostic)", &g_motion_flip);
+				ImGui::RadioButton("Motion kinds", &g_debug_mode, 0);
+				ImGui::SameLine();
+				ImGui::RadioButton("World layers / depth", &g_debug_mode, 1);
+				ImGui::TextUnformatted("Snapshots:");
+				ImGui::SameLine();
+				ImGui::RadioButton("Ground", &g_debug_mode, 2);
+				ImGui::SameLine();
+				ImGui::RadioButton("Floor", &g_debug_mode, 3);
+				ImGui::SameLine();
+				ImGui::RadioButton("Entities", &g_debug_mode, 4);
+				ImGui::SameLine();
+				ImGui::RadioButton("World with air", &g_debug_mode, 5);
+				ImGui::SameLine();
+				ImGui::RadioButton("Air split", &g_debug_mode, 6);
+				ImGui::TextDisabled("  World layers: dark = ground (far, always camera motion), blue = floor: belts, pipes, shadows, white = objects: buildings, character, vehicles, cyan = alt-mode icons (camera motion), yellow = flying: robots, effects (nearest).");
+				ImGui::TextDisabled("  No tint: moves with the camera. Blue: still (the character). Other colours: own motion, colour = direction. Tints that flicker on things that do not move are what shimmers. Close the overlay to see it. Not saved: off after a restart.");
+				{
+					float cam = 0, still = 0, own = 0;
+					bridge::motion_shares(cam, still, own);
+					ImGui::Text("Blocks: camera %.0f%% | still %.0f%% | own motion %.0f%%", cam * 100.0f, still * 100.0f, own * 100.0f);
+				}
+				{
+					const bool fsr_on = bridge::active() && std::strcmp(bridge::backend_name(), "FSR") == 0;
+					ImGui::BeginDisabled(!fsr_on);
+					ImGui::Checkbox("FSR debug view (AMD's own)", &g_fsr_debug);
+					ImGui::TextDisabled("  Shows only the generated frames, with FSR's internal pictures (motion, disocclusion, ...) drawn over them. Not saved.");
+					ImGui::EndDisabled();
+					ImGui::Checkbox("Show the GUI layer", &g_fsr_ui_layer);
+					ImGui::TextDisabled("  The world turns black; only what the add-on took for GUI (and the held character) stays. That layer is laid over every shown frame, so it should stay sharp when panning. Not saved.");
+					ImGui::BeginDisabled(!fsr_on);
+					ImGui::Checkbox("Show generated frames only (FSR)", &g_fsr_only_generated);
+					ImGui::TextDisabled("  Only FSR's in-between frames reach the screen (60 fps, choppy): a screenshot then shows a generated frame. Not saved.");
+					ImGui::EndDisabled();
+				}
 			}
+
+			// Developer tools: recordings for reports
+			if (g_dev_tools && ImGui::CollapsingHeader("Recordings and measurements (developer)", 0))
 			{
-				const bool fsr_on = bridge::active() && std::strcmp(bridge::backend_name(), "FSR") == 0;
-				ImGui::BeginDisabled(!fsr_on);
-				ImGui::Checkbox("FSR debug view (AMD's own)", &g_fsr_debug);
-				ImGui::TextDisabled("  Shows only the generated frames, with FSR's internal pictures (motion, disocclusion, ...) drawn over them. Not saved.");
+				changed |= ImGui::Checkbox("Measure the motion fit (status above, on-screen readout)", &g_fit_measure);
+				ImGui::BeginDisabled(!bridge::active() || g_trace_waiting);
+				if (ImGui::Button("Record 5 s of camera data##camtrace"))
+				{
+					g_trace_request = true;
+					g_trace_waiting = true;
+				}
 				ImGui::EndDisabled();
-				ImGui::Checkbox("Show the GUI layer", &g_fsr_ui_layer);
-				ImGui::TextDisabled("  The world turns black; only what the add-on took for GUI (and the held character) stays. That layer is laid over every shown frame, so it should stay sharp when panning. Not saved.");
-				ImGui::BeginDisabled(!fsr_on);
-				ImGui::Checkbox("Show generated frames only (FSR)", &g_fsr_only_generated);
-				ImGui::TextDisabled("  Only FSR's in-between frames reach the screen (60 fps, choppy): a screenshot then shows a generated frame. Not saved.");
-				ImGui::EndDisabled();
-			}
+				ImGui::SameLine();
+				if (g_trace_waiting)
+					ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "recording, %d frames to go - close this overlay and keep moving", bridge::camera_trace_left());
+				else
+					ImGui::TextDisabled("%s", g_trace_status.empty() ? "writes hudless_probe\\camera_trace_N.csv" : g_trace_status.c_str());
+				if (ImGui::Button("Write what is near the centre now##maskdump"))
+					sprite_mask::dump_now();
+				ImGui::SameLine();
+				ImGui::TextDisabled("(also written automatically when the character is lost: hudless_probe\\sprite_mask_N.txt)");
+				if (ImGui::CollapsingHeader("Sprite probe (1.2 step 0)", 0))
+				{
+					ImGui::TextWrapped("Records how Factorio sends its sprites to the GPU, for 6 seconds. Click Record, close this overlay and keep "
+						"running around (change direction a few times). Nothing changes in the picture; a short stutter every half second is "
+						"expected. Then send ReShade.log and the file named below.");
+					if (sprite_probe::active())
+						ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "Recording...");
+					else if (ImGui::Button("Record 6 s##sprite"))
+					{
+						static int run = 0;
+						wchar_t name[64];
+						std::swprintf(name, 64, L"sprite_probe_%d.txt", ++run);
+						sprite_probe::start(output_dir() / name, 360);
+					}
+					ImGui::SameLine();
+					ImGui::TextWrapped("Status: %s", sprite_probe::status());
+				}
 			}
 			if (changed)
 				save_config();

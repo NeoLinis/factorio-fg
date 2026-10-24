@@ -19,6 +19,7 @@
 
 #include <d3d12.h>
 #include <cstdint>
+#include <string>
 
 namespace motion
 {
@@ -48,6 +49,17 @@ namespace motion
 		bool floor_camera = true;    // 1.2: floor pixels (belts, rails, grass) take the camera's motion and the ground's depth
 		bool shadow_overlay = false; // 1.2: the UI layer lays the character's shadow over as a darkening: once its darkness
 		                             // is measured, the ground under the shadow gets the camera's motion (exact mask only)
+		bool sprite_camera = true;   // 1.3: take the camera's pan from the sprites when it is known exactly (and no zoom)
+		bool icon_depth_flat = true; // 1.3 beta 3: alt-mode icons get the depth of the building under them (no depth edge)
+		bool fit_measure = true;     // 1.3 beta 4: run the motion fit pass (readout); off for comparisons
+		int sprite_camera_support = 0, sprite_camera_tight = 0; // diagnostics for the camera trace
+		// 1.3 beta 5: alt-mode icons moved by their own sprites' shift (the air stage's, when most of its sprites agree)
+		bool icon_shift_valid = false;
+		float icon_dx = 0, icon_dy = 0;     // their sprites' shift since the last frame (full-res px)
+		bool icon_motion = true;            // use it for alt-mode icon pixels
+		float stage_diag[12] = {};          // trace: per stage 1..3: matched, residual x, residual y, share
+		bool sprite_camera_valid = false;              // this frame's sprite camera is known exactly
+		float sprite_camera_dx = 0, sprite_camera_dy = 0; // world sprites' shift since the last frame (full-res px)
 	};
 
 	// Starts compiling the shaders on a worker thread (or loads them from the cache). Optional; init() does it too.
@@ -116,5 +128,20 @@ namespace motion
 	ID3D12Resource *debug_texture();
 	// Share of blocks (0..1) moving with the camera / still / with their own motion, a few frames old.
 	void block_shares(float &camera, float &still, float &own);
+	// 1.3: the picture's camera fit compared with the sprites' exact shift, over recent frames where the camera moved
+	// (both measured every frame, whichever is used). used_last: the last frame used the sprites' shift.
+	struct camera_check { bool wanted = false, used_last = false; uint32_t frames = 0; float mean_diff = 0, share_off = 0; };
+	camera_check camera_compare();
+	// 1.3: motion fit, smoothed over recent frames: the previous frame moved by the motion vectors vs this frame, mean
+	// luma difference per layer (0 ground, 1 floor, 2 objects, 3 alt-mode icons, 4 flying, 5 everything without
+	// layers), with our vectors and with the camera alone; share = part of the sampled pixels in that layer. The
+	// character and its shadow are left out.
+	struct fit_info { float ours[6] = {}, camera[6] = {}, share[6] = {}; };
+	bool motion_fit(fit_info &out);
+	// 1.3 beta 4: camera trace - one line per frame for the next 'frames' frames (the sprites' shift, the picture's
+	// fit, which was used); trace_take() hands the text over once it is complete.
+	bool trace_start(uint32_t frames);
+	bool trace_take(std::string &out);
+	int trace_left();
 	const char *status();
 }

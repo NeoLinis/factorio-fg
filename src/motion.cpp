@@ -3,6 +3,7 @@
 #include "motion.h"
 
 #include <d3dcompiler.h>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -38,6 +39,9 @@ cbuffer Params : register(b0)
 	uint debug_view;       // 1: write the motion debug picture
 	float far_penalty;     // own motion: extra cost per half-res px of difference from the camera (repeating patterns)
 	float still_zone;      // "still" only within this radius of the screen centre, in screen heights
+	float2 sprite_cam;     // 1.3 (flag 524288): the camera's pan from Factorio's sprites, full-res px, previous minus
+	                       // current position (as t); used instead of the picture fit when there is no zoom
+	float2 icon_cam;       // 1.3 beta 5 (flag 2097152): alt-mode icons' own shift from their sprites (previous minus current)
 };
 
 Texture2D<float4> hudless : register(t0);
@@ -340,6 +344,10 @@ void cs_global_zoom(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 #define SH_BINS 32
 #define SH_CLASSES 4
 #define SH_MIN_SAMPLES 60
+// 1.3 motion fit (cs_fit): per class (0 ground, 1 floor, 2 objects, 3 icons, 4 flying, 5 no layers) the summed luma
+// difference x 256 with our vectors, with the camera alone, and the sample count.
+#define FIT_BASE 160
+#define FIT_CLASSES 6
 void shadow_finish()
 {
 	[loop] for (uint cls = 0; cls < SH_CLASSES; ++cls)
@@ -435,6 +443,8 @@ void cs_global_coarse_pick(uint3 id : SV_DispatchThreadID)
 	global_motion[2] = float4(float2(bd), confidence, float(best));
 	global_motion[6] = float4(a, zc, 0);
 	stats[0] = 0; stats[1] = 0; stats[2] = 0; stats[3] = 0; stats[4] = 0; stats[5] = 0;
+	[unroll] for (uint fi = 0; fi < FIT_CLASSES * 3; ++fi)
+		stats[FIT_BASE + fi] = 0;
 	shadow_finish();
 }
 
@@ -538,6 +548,20 @@ void cs_global_final(uint3 id : SV_DispatchThreadID)
 	bool valid = (flags & 4) != 0;
 	global_motion[1] = valid ? global_motion[0] : float4(0, 0, 0, 0);
 	global_motion[5] = valid ? global_motion[4] : float4(1, float2(full_size) * 0.5, 0);
+	// 1.3: the picture's own fit is kept in [6].w / [7].w (half-res px) for the comparison with the sprites' shift
+	float4 c6 = global_motion[6], c7 = global_motion[7];
+	c6.w = t.x * 0.5;
+	c7.w = t.y * 0.5;
+	global_motion[6] = c6;
+	global_motion[7] = c7;
+	// The sprites' shift is exact (Factorio's own positions); the fit lands within a fraction of a pixel of it, which
+	// is what repeating sharp things (module icons, rails) show as jitter in generated frames. Pan only: while zooming
+	// the sprites' sizes change and the shift is not known (the CPU does not set the flag then).
+	if ((flags & 524288) != 0 && abs(a - 1.0) < 0.0005)
+	{
+		t = sprite_cam;
+		a = 1.0;
+	}
 	global_motion[0] = float4(t * 0.5, global_motion[2].z, float(best)); // full-res -> half-res px
 	global_motion[4] = float4(a, fine.yz, 1);
 }
@@ -1419,12 +1443,16 @@ void cs_expand(uint3 id : SV_DispatchThreadID)
 	float2 t_full = global_motion[0].xy * 2.0;
 	// ground far, floor (belts, shadows), objects, alt-mode icons, flying (bots) nearest
 	const float layer = layers_valid() ? entity_mask[p] : 0.0;
-	float depth = layer >= LAYER_AIR ? 0.1 : (is_icon(layer) ? 0.15 : (layer >= LAYER_OBJECT ? DEPTH_NEAR :
+	// 1.3 beta 3 (flag 1048576): alt-mode icons get the depth of the building they sit on. Their own nearer depth puts a
+	// depth edge around every icon (zoomed out: around every few pixels, at half-res precision), which frame generation
+	// may treat as occlusion boundaries and blend across - the suspect for module rows blurring together with DLSS-G.
+	const bool icon_flat = (flags & 1048576) != 0;
+	float depth = layer >= LAYER_AIR ? 0.1 : (is_icon(layer) ? (icon_flat ? DEPTH_NEAR : 0.15) : (layer >= LAYER_OBJECT ? DEPTH_NEAR :
 		(layer > 0.0 && !floor_cam ? 0.5 * (DEPTH_NEAR + DEPTH_FAR) : DEPTH_FAR)));
 	// FSR: the same order, spread far apart once FSR turns depth into distances (near 0.1, far 100: ground ~50,
 	// floor ~1, objects ~0.2, flying ~0.13), so it never pulls the character into the ground around it.
 	if (flags & 16384)
-		depth = layer >= LAYER_AIR ? 0.2 : (is_icon(layer) ? 0.4 : (layer >= LAYER_OBJECT ? 0.5 : (layer > 0.0 && !floor_cam ? 0.9 : 0.999)));
+		depth = layer >= LAYER_AIR ? 0.2 : (is_icon(layer) ? (icon_flat ? 0.5 : 0.4) : (layer >= LAYER_OBJECT ? 0.5 : (layer > 0.0 && !floor_cam ? 0.9 : 0.999)));
 	if (as_ground)
 		depth = (flags & 16384) ? 0.999 : DEPTH_FAR;
 	uint2 f = id.xy * 2;
@@ -1440,6 +1468,10 @@ void cs_expand(uint3 id : SV_DispatchThreadID)
 		// half-res -> full-res pixels; the camera exactly at this full-res pixel
 		const float2 v_cam = (mdl.x - 1.0) * (float2(q) - mdl.yz) + t_full;
 		float2 v = use_camera ? v_cam : mv * 2.0;
+		// 1.3 beta 5: alt-mode icons with their own sprites' shift. Factorio places the world on whole pixels; when the
+		// icons are rounded on their own they can land a pixel off the world's shift in some frames.
+		if ((flags & 2097152) != 0 && icon_here)
+			v = icon_cam;
 		float d = depth;
 		float hv = hold ? (mask_here >= LAYER_ICON - 0.01 ? 0.5 : (mask_here >= LAYER_OBJECT - 0.01 ? 1.0 : 0.8)) : 0.0;
 		[branch] if (exact_mask() && all(q < full_size))
@@ -1495,12 +1527,68 @@ void cs_expand(uint3 id : SV_DispatchThreadID)
 				v = float2(0, 0);
 				hv = 0.8;
 			}
-			else if (still_px && any(abs(cam) >= 1.0))
+			else if (still_px)
 				v = v_cam; // "stays put" outside the character: only the character does (a block mostly covering it)
+			// 1.3 beta 1: also while the camera moves less than 1 half-res px per frame. Zoomed out, running moves the
+			// world by only 1-2 full-res px per frame, and inside the still zone thin, sharp things (elevated rails, power
+			// wires, building edges) matched "no motion" about as well as that sub-pixel shift: they kept zero motion and
+			// stood still in generated frames while everything outside the zone slid - a circle around the character,
+			// like a force field.
 		}
 		if (flags & 1) v = -v;
 		if ((flags & 2) == 0) v = float2(0, 0);
 		if (all(q < full_size)) { mvec[q] = v; depth_out[q] = d; hold_out[q] = hv; }
+	}
+}
+
+// 1.3 motion fit: how well the motion vectors explain this frame - the previous frame moved by them vs this one, per
+// layer, against the camera alone. Every 2nd full-res pixel in x and y; the character and its shadow left out (they
+// stay put on screen while their animation changes). Sums per group in shared memory, then one atomic per counter.
+groupshared uint gs_fit[FIT_CLASSES * 3];
+[numthreads(8, 8, 1)]
+void cs_fit(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+	if (gi < FIT_CLASSES * 3) gs_fit[gi] = 0;
+	GroupMemoryBarrierWithGroupSync();
+	const uint2 q = id.xy * 2;
+	[branch] if (all(q < full_size) && (flags & 6) == 6)
+	{
+		float2 v = mvec[q];
+		if (flags & 1) v = -v;
+		const float4 mdl = global_motion[4];
+		const float2 v_cam = (mdl.x - 1.0) * (float2(q) - mdl.yz) + global_motion[0].xy * 2.0;
+		const float2 pp = float2(q) + v, pc = float2(q) + v_cam;
+		const float2 hi = float2(full_size) - 2.0;
+		bool use = all(pp >= 1.0) && all(pp <= hi) && all(pc >= 1.0) && all(pc <= hi);
+		if (use && exact_mask())
+		{
+			const float4 cm = char_mask.Load(int3(q, 0));
+			use = cm.r <= 0.02 && cm.g <= 0.004;
+		}
+		else if (use)
+			use = !(all(abs(v) < 0.25) && any(abs(v_cam) >= 1.0)); // held still (the guessed character)
+		[branch] if (use)
+		{
+			const float l = luma_full[q];
+			const uint e_own = uint(abs(l - bl_full_prev(pp)) * 256.0 + 0.5);
+			const uint e_cam = uint(abs(l - bl_full_prev(pc)) * 256.0 + 0.5);
+			uint cls = 5;
+			if (layers_valid())
+			{
+				const float mk = entity_mask[q / 2];
+				cls = mk >= LAYER_AIR ? 4u : (is_icon(mk) ? 3u : (mk >= LAYER_OBJECT - 0.01 ? 2u : (mk > 0.0 ? 1u : 0u)));
+			}
+			uint dummy;
+			InterlockedAdd(gs_fit[cls * 3 + 0], e_own, dummy);
+			InterlockedAdd(gs_fit[cls * 3 + 1], e_cam, dummy);
+			InterlockedAdd(gs_fit[cls * 3 + 2], 1u, dummy);
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+	[branch] if (gi < FIT_CLASSES * 3 && gs_fit[gi] != 0)
+	{
+		uint dummy;
+		InterlockedAdd(stats[FIT_BASE + gi], gs_fit[gi], dummy);
 	}
 }
 
@@ -1554,10 +1642,10 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 )hlsl";
 
 	enum pass { PASS_LUMA, PASS_DETAIL, PASS_DOWN, PASS_DOWN8, PASS_GLOBAL_COARSE, PASS_GLOBAL_ZOOM, PASS_GLOBAL_COARSE_PICK, PASS_GLOBAL_FINE, PASS_GLOBAL_PICK,
-		PASS_GLOBAL_REFINE, PASS_GLOBAL_FINAL, PASS_BLOCK_PRE, PASS_MOVER, PASS_BLOCK, PASS_SMOOTH, PASS_EXPAND, PASS_DEBUG, PASS_COUNT };
+		PASS_GLOBAL_REFINE, PASS_GLOBAL_FINAL, PASS_BLOCK_PRE, PASS_MOVER, PASS_BLOCK, PASS_SMOOTH, PASS_EXPAND, PASS_DEBUG, PASS_FIT, PASS_COUNT };
 	const char *const ENTRY_POINTS[PASS_COUNT] = { "cs_luma", "cs_detail", "cs_down", "cs_down8", "cs_global_coarse", "cs_global_zoom", "cs_global_coarse_pick",
 		"cs_global_fine", "cs_global_pick", "cs_global_refine", "cs_global_final", "cs_block_pre", "cs_mover", "cs_block", "cs_smooth", "cs_expand",
-		"cs_debug" };
+		"cs_debug", "cs_fit" };
 
 	struct constants
 	{
@@ -1570,6 +1658,8 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 		uint32_t debug_view;
 		float far_penalty;
 		float still_zone;
+		float sprite_cam_x, sprite_cam_y; // 1.3: previous minus current, full-res px
+		float icon_cam_x, icon_cam_y;     // 1.3 beta 5: alt-mode icons, previous minus current
 	};
 	constexpr UINT CONSTANT_COUNT = sizeof(constants) / 4;
 	constexpr UINT TABLE_SIZE = 32; // t0, u0..u23, t1..t6 (world layers), t7 (exact character mask)
@@ -1577,7 +1667,9 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 	constexpr UINT LAYER_SLOT = 1 + UAV_COUNT; // t1 ground, t2 entities, t3 floor, t4 post-cloud, t5 world, from this slot
 	constexpr UINT LAYER_COUNT = 6;
 	constexpr UINT CHAR_SLOT = LAYER_SLOT + LAYER_COUNT; // t7 exact character mask
-	constexpr UINT STATS_BYTES = 640; // uint[3] blocks per kind, searched, wide-searched, movers found; [8..159] shadow darkness (SH_*)
+	constexpr UINT STATS_BYTES = 768; // uint[3] blocks per kind, searched, wide-searched, movers found; [8..159] shadow darkness (SH_*);
+	                                  // [160..177] motion fit (FIT_*)
+	constexpr UINT FIT_BASE = 160, FIT_CLASSES = 6;
 	constexpr UINT COARSE_N = 33, ZOOM_SCALES = 25, ZOOM_T = 7, ZOOM_VARIANTS = 5, FINE_N = 7, REFINE_N = 7;
 	constexpr UINT SAD_COUNT = 2 * COARSE_N * COARSE_N + 2 * ZOOM_SCALES * ZOOM_T * ZOOM_T + ZOOM_VARIANTS * FINE_N * FINE_N + ZOOM_VARIANTS * REFINE_N * REFINE_N;
 	constexpr UINT GLOBAL_ENTRIES = 8; // float4 each
@@ -1630,6 +1722,21 @@ void cs_debug(uint3 id : SV_DispatchThreadID)
 		char status[200] = "off";
 		float gpu_camera_ms = 0, gpu_block_ms = 0, gpu_rest_ms = 0; // per stage, smoothed
 		bool pipelines_ready = false, pipelines_failed = false;
+		// 1.3: the sprites' camera shift per readback slot (previous minus current, full-res px), for the comparison
+		bool scam_valid[3] = {}, scam_used[3] = {};
+		float scam_x[3] = {}, scam_y[3] = {};
+		bool scam_wanted = false, scam_used_last = false;
+		int scam_support[3] = {}, scam_tight[3] = {};
+		float stage_diag[3][12] = {};
+		bool icon_used[3] = {};
+		uint32_t trace_left = 0;  // camera trace: frames still to record
+		bool trace_done = false;
+		std::string trace;
+		uint32_t cam_frames = 0;           // compared frames (camera moving)
+		float cam_diff = 0, cam_off = 0;   // smoothed |picture fit - sprites| (px) and share of frames over 0.25 px
+		// 1.3: motion fit, smoothed (per class: mean luma difference with our vectors / camera alone, share of samples)
+		float fit_ours[6] = {}, fit_cam[6] = {}, fit_share[6] = {};
+		bool fit_valid = false;
 	};
 	state *m = nullptr;
 	char g_off[] = "off";
@@ -2298,7 +2405,10 @@ namespace motion
 			| (options.hold_as_ground ? 32768u : 0u)
 			| (charm != nullptr ? 65536u : 0u)
 			| (charm != nullptr && options.shadow_overlay ? 131072u : 0u)
-			| (options.floor_camera ? 262144u : 0u);
+			| (options.floor_camera ? 262144u : 0u)
+			| (options.sprite_camera && options.sprite_camera_valid ? 524288u : 0u)
+			| (options.icon_depth_flat ? 1048576u : 0u)
+			| (options.icon_motion && options.icon_shift_valid && options.sprite_camera_valid ? 2097152u : 0u);
 		// SAD units: sum over 64 half-res pixels of |luma difference| (each 0..1)
 		c.penalty_zero = options.penalty_zero;
 		c.penalty_other = options.penalty_zero * 1.4f;
@@ -2311,6 +2421,10 @@ namespace motion
 		c.debug_view = options.debug_view ? 1u : 0u;
 		c.far_penalty = options.far_penalty;
 		c.still_zone = options.still_zone;
+		c.sprite_cam_x = -options.sprite_camera_dx; // the sprites moved by d: a pixel was at p - d
+		c.sprite_cam_y = -options.sprite_camera_dy;
+		c.icon_cam_x = -options.icon_dx;
+		c.icon_cam_y = -options.icon_dy;
 
 		// State for a (new) command list: bindings, buffers back to UAV (they decay to COMMON after every
 		// ExecuteCommandLists), the inputs readable.
@@ -2359,6 +2473,15 @@ namespace motion
 		begin_list(list);
 
 		const UINT slot = static_cast<UINT>(m->frame % 3);
+		m->scam_valid[slot] = options.sprite_camera_valid && m->history >= 2;
+		m->scam_used[slot] = (c.flags & 524288u) != 0;
+		m->scam_x[slot] = c.sprite_cam_x;
+		m->scam_y[slot] = c.sprite_cam_y;
+		m->scam_wanted = options.sprite_camera;
+		m->scam_support[slot] = options.sprite_camera_support;
+		m->scam_tight[slot] = options.sprite_camera_tight;
+		std::memcpy(m->stage_diag[slot], options.stage_diag, sizeof(options.stage_diag));
+		m->icon_used[slot] = (c.flags & 2097152u) != 0;
 		if (m->timestamps != nullptr)
 			list->EndQuery(m->timestamps, D3D12_QUERY_TYPE_TIMESTAMP, slot * TS_PER_SLOT);
 		list->SetPipelineState(m->pso[PASS_LUMA]);
@@ -2423,6 +2546,12 @@ namespace motion
 		list->SetPipelineState(m->pso[PASS_EXPAND]);
 		list->Dispatch(groups(m->half_w, 8), groups(m->half_h, 8), 1);
 		uav_barrier(list);
+		if (options.fit_measure)
+		{
+			list->SetPipelineState(m->pso[PASS_FIT]);
+			list->Dispatch(groups((m->w + 1) / 2, 8), groups((m->h + 1) / 2, 8), 1);
+			uav_barrier(list);
+		}
 		m->debug_written = false;
 		if (options.debug_view && m->debug != nullptr)
 		{
@@ -2494,6 +2623,60 @@ namespace motion
 			float z[4];
 			std::memcpy(z, static_cast<const char *>(m->readback_ptr[(slot + 1) % 3]) + 4 * 16, sizeof(z));
 			m->gzoom = (z[0] > 0.1f && z[0] < 10.0f) ? 1.0f / z[0] : 1.0f; // > 1: things got bigger (zooming in)
+		}
+		{
+			// 1.3, from the frame two back (its readback is done): the picture's own camera fit ([6].w, [7].w) against the
+			// sprites' exact shift, while the camera moves without zoom; and the motion fit per layer.
+			const UINT r = (slot + 1) % 3;
+			const char *rb = static_cast<const char *>(m->readback_ptr[r]);
+			float gg[GLOBAL_ENTRIES * 4];
+			std::memcpy(gg, rb, sizeof(gg));
+			m->scam_used_last = m->scam_used[r];
+			if (m->trace_left > 0 && m->frame >= 3)
+			{
+				char line[512];
+				const float *sd = m->stage_diag[r];
+				std::snprintf(line, sizeof(line), "%llu,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.6f,%.3f,%.4f,%.4f,%.0f,%.2f,%.2f,%.2f,%.0f,%.2f,%.2f,%.2f,%.0f,%.2f,%.2f,%.2f,%d\n",
+					static_cast<unsigned long long>(m->frame - 2), m->scam_valid[r] ? 1 : 0, m->scam_used[r] ? 1 : 0, m->scam_support[r],
+					m->scam_tight[r], m->scam_x[r], m->scam_y[r], gg[27] * 2.0f, gg[31] * 2.0f, gg[16], gg[2], gg[0] * 2.0f, gg[1] * 2.0f,
+					sd[0], sd[1], sd[2], sd[3], sd[4], sd[5], sd[6], sd[7], sd[8], sd[9], sd[10], sd[11], m->icon_used[r] ? 1 : 0);
+				m->trace += line;
+				if (--m->trace_left == 0)
+					m->trace_done = true;
+			}
+			if (m->frame >= 3 && m->scam_valid[r] && std::fabs(gg[16] - 1.0f) < 0.0005f)
+			{
+				const float px = gg[27] * 2.0f, py = gg[31] * 2.0f, sx = m->scam_x[r], sy = m->scam_y[r];
+				if (std::fabs(sx) + std::fabs(sy) >= 0.5f && px == px && py == py)
+				{
+					const float d = std::sqrt((px - sx) * (px - sx) + (py - sy) * (py - sy));
+					const float k = m->cam_frames < 50 ? 1.0f / static_cast<float>(m->cam_frames + 1) : 0.02f;
+					m->cam_diff += (d - m->cam_diff) * k;
+					m->cam_off += ((d > 0.25f ? 1.0f : 0.0f) - m->cam_off) * k;
+					++m->cam_frames;
+				}
+			}
+			uint32_t fit[FIT_CLASSES * 3];
+			std::memcpy(fit, rb + GLOBAL_ENTRIES * 16 + FIT_BASE * 4, sizeof(fit));
+			uint64_t total = 0;
+			for (UINT i = 0; i < FIT_CLASSES; ++i)
+				total += fit[i * 3 + 2];
+			if (m->frame >= 3 && total >= 1000)
+			{
+				for (UINT i = 0; i < FIT_CLASSES; ++i)
+				{
+					const uint32_t n = fit[i * 3 + 2];
+					const float share = static_cast<float>(n) / static_cast<float>(total);
+					m->fit_share[i] += (share - m->fit_share[i]) * 0.1f;
+					if (n == 0)
+						continue;
+					const float ours = static_cast<float>(fit[i * 3]) / (256.0f * static_cast<float>(n));
+					const float cam = static_cast<float>(fit[i * 3 + 1]) / (256.0f * static_cast<float>(n));
+					m->fit_ours[i] = m->fit_valid ? m->fit_ours[i] + (ours - m->fit_ours[i]) * 0.1f : ours;
+					m->fit_cam[i] = m->fit_valid ? m->fit_cam[i] + (cam - m->fit_cam[i]) * 0.1f : cam;
+				}
+				m->fit_valid = true;
+			}
 		}
 
 		++m->frame;
@@ -2607,6 +2790,59 @@ namespace motion
 		dx = m != nullptr ? m->gdx : 0.0f;
 		dy = m != nullptr ? m->gdy : 0.0f;
 		confidence = m != nullptr ? m->gconf : 0.0f;
+	}
+
+	camera_check camera_compare()
+	{
+		camera_check c;
+		if (m == nullptr)
+			return c;
+		c.wanted = m->scam_wanted;
+		c.used_last = m->scam_used_last;
+		c.frames = m->cam_frames;
+		c.mean_diff = m->cam_diff;
+		c.share_off = m->cam_off;
+		return c;
+	}
+
+	int trace_left()
+	{
+		return m != nullptr ? static_cast<int>(m->trace_left) : 0;
+	}
+
+	bool trace_start(uint32_t frames)
+	{
+		if (m == nullptr || frames == 0)
+			return false;
+		m->trace = "frame,sprites_exact,sprites_used,support,tight,sprites_x,sprites_y,picture_x,picture_y,zoom,match,used_x,used_y,"
+			"floor_n,floor_rx,floor_ry,floor_share,objects_n,objects_rx,objects_ry,objects_share,air_n,air_rx,air_ry,air_share,icons_own\n";
+		m->trace_left = frames;
+		m->trace_done = false;
+		return true;
+	}
+
+	bool trace_take(std::string &out)
+	{
+		if (m == nullptr || !m->trace_done)
+			return false;
+		out.swap(m->trace);
+		m->trace.clear();
+		m->trace_done = false;
+		return true;
+	}
+
+	bool motion_fit(fit_info &out)
+	{
+		out = fit_info{};
+		if (m == nullptr || !m->fit_valid)
+			return false;
+		for (int i = 0; i < 6; ++i)
+		{
+			out.ours[i] = m->fit_ours[i];
+			out.camera[i] = m->fit_cam[i];
+			out.share[i] = m->fit_share[i];
+		}
+		return true;
 	}
 
 	const char *status()

@@ -87,6 +87,9 @@ The defaults are the recommended settings. On an NVIDIA RTX card you can switch 
   smooth.
 - Uncovered ground right behind a fast-moving character, and items on fast belts while you run against them, can show
   small artifacts in generated frames.
+- Rows of alt-mode icons (modules, science packs) can blur or pulse slightly at some zoom levels while you move
+  sideways. Factorio moves the world in whole pixels, and DLSS-G / FSR show the in-between frames between pixels; a
+  frame generator of our own that keeps every frame on whole pixels is planned for 1.4 (see the roadmap).
 - FSR is limited to 2x.
 
 ## Problems?
@@ -101,6 +104,7 @@ The defaults are the recommended settings. On an NVIDIA RTX card you can switch 
 ## More
 
 - **How it works, every setting, building it yourself:** [`docs/HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md)
+- **What's next:** [`docs/ROADMAP.md`](docs/ROADMAP.md)
 - **What changed:** [`CHANGELOG.md`](CHANGELOG.md) - **how it was developed, step by step:** [`DEVLOG.md`](DEVLOG.md)
 
 ## Licence

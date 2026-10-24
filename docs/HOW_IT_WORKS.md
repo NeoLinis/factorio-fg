@@ -73,31 +73,37 @@ Saved in `bin\x64\ReShade.ini`, section `[FACTORIO_HUDLESS_PROBE]`. The defaults
 
 ### Frame generation tab
 
-| Setting | What it does |
-|---|---|
-| Frame generation on | Presents the game through the add-on's window with frame generation. Off: Factorio as usual. |
-| Technology | Automatic (DLSS-G on NVIDIA RTX when installed, else FSR), DLSS-G or FSR. Applies at the next start. |
-| Multiplier | Off, 2x, 3x, 4x or Auto (the largest that stays within the monitor's refresh rate; *Auto target fps* overrides it). FSR: 2x at most. |
-| Character in generated frames | *Laid over* (default): from the newest real frame, sharp. *Generated*: blended by frame generation with its exact motion. |
-| ...and remove it from what frame generation blends | Off by default, for comparison: frame generation gets the ground under the character instead. |
-| Scene-cut detection | Starts frame generation over on map view, surface change, teleport. |
-| Tearing / VRR present | Leave on with G-Sync / FreeSync. |
-| On-screen readout | The readout (Ctrl+F11 by default) and its hotkey. |
-| Hide frame generation while the Steam overlay is open | So the overlay can be seen; *go by Shift+Tab* if Steam does not tell the add-on. |
-| Setup check | Checks GPU scheduling, DLSS-G files, FSR files, the shader compiler and duplicate add-ons. |
+| Section | Setting | What it does |
+|---|---|---|
+| (top) | Frame generation on | Presents the game through the add-on's window with frame generation. Off: Factorio as usual. |
+| | Technology | Automatic (DLSS-G on NVIDIA RTX when installed, else FSR), DLSS-G or FSR. Applies at the next start. |
+| | Multiplier | Off, 2x, 3x, 4x or Auto (the largest that stays within the monitor's refresh rate; *Auto target fps* overrides it). FSR: 2x at most. |
+| Character | Character in generated frames | *Laid over* (default): from the newest real frame, sharp. *Generated*: blended by frame generation with its exact motion. |
+| | ...and remove it from what frame generation blends | Off by default, for comparison: frame generation gets the ground under the character instead. |
+| Scene cuts | Scene-cut detection | Starts frame generation over on map view, surface change, teleport. |
+| Display and overlays | Tearing / VRR present | Leave on with G-Sync / FreeSync. |
+| | On-screen readout | The readout (Ctrl+F11 by default) and its hotkey. |
+| | Hide frame generation while the Steam overlay is open | So the overlay can be seen; *go by Shift+Tab* if Steam does not tell the add-on. |
+| Status | | The technology's state, the bridge, GPU time of the motion passes, the stutter counter. |
+| Setup | Setup check | Checks GPU scheduling, DLSS-G files, FSR files, the shader compiler and duplicate add-ons. |
 
 ### Motion vectors tab
 
-| Setting | What it does |
-|---|---|
-| Character tracking | Builds the mask from Factorio's sprites (*Show it* draws it in red/blue), uses it for frame generation, and lays the shadow over as a darkening. The status lines show what was found and the measured shadow darkness. |
-| Motion vectors | Off: frame generation uses only its own optical flow (for comparison). |
-| World layers | Uses the six snapshots (strongly recommended). After a Factorio update that changes its shaders, the snapshot points are found from the frame's structure instead. |
-| Alt-mode icons are drawn before the split | Separates alt-mode icons from flying robots in the air layer. |
-| Mover search / Wide search for fast movers | Finds things that move on their own; the wide search reaches fast trains (192 px per frame). |
-| Belts and other floor: own motion only where it is certain | On by default. Off: belts are treated like everything else (as before 1.2). |
-| Fine tuning | The block decision thresholds; *Reset to defaults* restores them. |
-| Debug views | Replace the picture (frame generation pauses): *Motion kinds* (tint = own motion, hue = direction), *World layers / depth* (dark ground, blue floor, white objects, cyan icons, yellow flying), the raw snapshots, and FSR's own debug view. |
+| Section | Setting | What it does |
+|---|---|---|
+| Status | | Where the camera's shift came from, the motion fit per layer (lower is better) and the depth status. |
+| Motion vectors | Motion vectors | Off: frame generation uses only its own optical flow (for comparison). |
+| | World layers | Uses the six snapshots (strongly recommended). After a Factorio update that changes its shaders, the snapshot points are found from the frame's structure instead. |
+| | Camera from Factorio's sprites | The camera's pan read off the exact positions of the sprites Factorio draws (not while zooming); otherwise fitted to the picture. Needs *Character tracking*. |
+| | Belts and other floor: own motion only where it is certain | On by default. Off: belts are treated like everything else (as before 1.2). |
+| Character tracking | | Builds the mask from Factorio's sprites (*Show it* draws it in red/blue), uses it for frame generation, and lays the shadow over as a darkening. The status lines show what was found and the measured shadow darkness. |
+| Trains, cars, bots | Mover search / Wide search for fast movers | Finds things that move on their own; the wide search reaches fast trains (192 px per frame). |
+| Alt-mode icons | Depth of the building under them | No depth edge around each icon (on). |
+| | Motion from their own sprites (for mods) | Off by default: in vanilla icons move exactly with the world. |
+| | Air split | Separates alt-mode icons from flying robots in the air layer. |
+| Fine tuning | | The block decision thresholds; *Reset to defaults* restores them. |
+| Debug views | | Replace the picture (frame generation pauses): *Motion kinds* (tint = own motion, hue = direction), *World layers / depth* (dark ground, blue floor, white objects, cyan icons, yellow flying), the raw snapshots, FSR's own debug view; flip the vectors' sign. |
+| Recordings (developer tools) | | Motion fit on/off, a 5 s camera trace (`hudless_probe\camera_trace_N.csv`), a mask dump, the sprite probe. |
 
 ## Surfaces
 
@@ -115,8 +121,10 @@ Saved in `bin\x64\ReShade.ini`, section `[FACTORIO_HUDLESS_PROBE]`. The defaults
 - The ground just uncovered behind a fast-moving character is guessed by frame generation and can look noisy.
 - Items on belts take the belt's motion where it is unambiguous; running fast against a busy belt can still show
   artifacts (tracking each item from its sprite is planned).
-- Module icons can look soft zoomed out on a pan; check with frame generation off - Factorio's own rendering does
-  this too.
+- Rows of alt-mode icons can blur, jitter or pulse at some zoom levels while moving sideways. Factorio moves the world
+  by whole pixels per frame (running: 7, 7, ..., 7, 6 px); DLSS-G and FSR place in-between frames at fixed fractions of
+  that step, between pixels unless the step is a multiple of the multiplier, and resample there. The readout line
+  *In-between positions* shows it. Planned remedy: pixel-exact frame generation (roadmap, 1.4).
 - FSR is 2x only. FSR 4 (Radeon RX 9000) has not been tested.
 
 ## Troubleshooting details

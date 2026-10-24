@@ -197,11 +197,20 @@ namespace sprite_mask
 		int g_shadow_missing = 0;        // frames with a character but no shadow on that target
 		std::vector<sprite> g_cur, g_prev;
 		// for the camera shift: world sprites anywhere on the screen (texture region + size key, top-left corner)
-		struct cam_sprite { uint64_t key; float x, y; };
+		struct cam_sprite { uint64_t key; float x, y; uint8_t stage; };
 		std::vector<cam_sprite> g_cam_cur, g_cam_prev;
 		bool g_prev_valid = false;
 		float g_cam_x = 0, g_cam_y = 0;
 		bool g_cam_known = false;
+		// 1.3: the camera shift for frame generation. Static sprites all move by exactly the camera's shift (Factorio's
+		// float positions), so most deltas agree to a few hundredths of a pixel: 'exact' then, their mean is the camera.
+		bool g_cam_exact = false, g_cam_this_frame = false;
+		int g_cam_tight = 0;
+		// 1.3 beta 5: how each world stage moved relative to the camera this frame (1 floor, 2 objects, 3 air: alt-mode
+		// icons, bots). Every sprite matched to the nearest same-looking sprite of last frame near where the camera puts
+		// it; the most common difference (0.25 px bins) and its share.
+		camera_info::stage_shift g_stage[4] = {};
+		bool g_stage_on = false; // beta 6: only when asked (it cost about 0.7 ms per frame on Factorio's thread)
 
 		// ------------------------------------------------------------ D3D11 objects
 
@@ -626,13 +635,13 @@ float4 ps_overlay(float4 pos : SV_Position) : SV_Target
 			const float reach = g_char_size > 0.0f ? std::min(full_reach, std::max(64.0f, 5.0f * g_char_size)) : full_reach;
 			const float max_side = 0.45f * std::min(W, H), cam_box = 0.3f * std::min(W, H);
 			// camera sprites: key = texture view + region + size, place = top-left corner
-			auto add_cam = [&](uint64_t view, float x, float y, float x3, float y3, float u0, float v0, float u3, float v3) {
+			auto add_cam = [&](uint64_t view, float x, float y, float x3, float y3, float u0, float v0, float u3, float v3, int stage) {
 				uint64_t k = mix(mix(1469598103934665603ull, static_cast<int64_t>(view)), std::llround(u0 * 16384.0f));
 				k = mix(mix(mix(k, std::llround(v0 * 16384.0f)), std::llround(u3 * 16384.0f)), std::llround(v3 * 16384.0f));
 				k = mix(mix(k, std::llround((x3 - x) * 4.0f)), std::llround((y3 - y) * 4.0f));
 				// thinned by key (the same sprites in both frames) when there are too many
 				if (((k >> 17) % g_cam_sub) == 0)
-					g_cam_cur.push_back({ k, std::min(x, x3), std::min(y, y3) });
+					g_cam_cur.push_back({ k, std::min(x, x3), std::min(y, y3), static_cast<uint8_t>(stage) });
 			};
 			for (const draw_rec &d : g_draws)
 			{
@@ -671,7 +680,7 @@ float4 ps_overlay(float4 pos : SV_Position) : SV_Target
 							std::memcpy(&v0, p0 + 12, 4);
 							std::memcpy(&u3, p3 + 8, 4);
 							std::memcpy(&v3, p3 + 12, 4);
-							add_cam(d.view, x, y, x3, y3, u0, v0, u3, v3);
+							add_cam(d.view, x, y, x3, y3, u0, v0, u3, v3, d.stage);
 						}
 						if (d.stage == 1 && d.target == 0) // floor stage: camera only
 							continue;
@@ -712,7 +721,7 @@ float4 ps_overlay(float4 pos : SV_Position) : SV_Target
 					if (!inside)
 						continue;
 					if (!d.fast && d.target == 0 && g_cam_cur.size() < 16000 && std::fabs(s.px[0] - cx) < cam_box && std::fabs(s.py[0] - cy) < cam_box)
-						add_cam(d.view, s.px[0], s.py[0], s.px[3], s.py[3], s.u[0], s.v[0], s.u[3], s.v[3]);
+						add_cam(d.view, s.px[0], s.py[0], s.px[3], s.py[3], s.u[0], s.v[0], s.u[3], s.v[3], d.stage);
 					const float w = s.x1 - s.x0, h = s.y1 - s.y0;
 					s.cx = (s.x0 + s.x1) * 0.5f;
 					s.cy = (s.y0 + s.y1) * 0.5f;
@@ -736,6 +745,8 @@ float4 ps_overlay(float4 pos : SV_Position) : SV_Target
 
 		// ------------------------------------------------------------ which sprites follow the camera
 
+
+		void stage_shifts();
 
 		// The camera shift: world sprites whose texture region and size appear once in both frames, anywhere on screen.
 		void find_camera()
@@ -797,10 +808,123 @@ float4 ps_overlay(float4 pos : SV_Position) : SV_Target
 				g_cam_x = static_cast<float>(mx / m);
 				g_cam_y = static_cast<float>(my / m);
 			}
+			// 1.3: refine to the static sprites. Swaying trees, belt items and animations inside the window above spread
+			// around the camera; static sprites sit exactly on it. Median of the window, then the mean of the deltas
+			// within 0.05 px of it - if most of the window is there (otherwise Factorio's positions were not exact, e.g.
+			// snapped to pixels, and the window's mean is the better estimate).
+			g_cam_exact = false;
+			g_cam_tight = 0;
+			if (m >= 3)
+			{
+				std::vector<float> wx, wy;
+				wx.reserve(static_cast<size_t>(m));
+				wy.reserve(static_cast<size_t>(m));
+				for (const auto &d : deltas)
+					if (std::fabs(d.first - static_cast<float>(bx)) <= 1.5f && std::fabs(d.second - static_cast<float>(by)) <= 1.5f)
+					{
+						wx.push_back(d.first);
+						wy.push_back(d.second);
+					}
+				std::vector<float> sx = wx, sy = wy;
+				std::nth_element(sx.begin(), sx.begin() + sx.size() / 2, sx.end());
+				std::nth_element(sy.begin(), sy.begin() + sy.size() / 2, sy.end());
+				const float medx = sx[sx.size() / 2], medy = sy[sy.size() / 2];
+				double tx = 0, ty = 0;
+				int tn = 0;
+				for (size_t i = 0; i < wx.size(); ++i)
+					if (std::fabs(wx[i] - medx) <= 0.05f && std::fabs(wy[i] - medy) <= 0.05f)
+					{
+						tx += wx[i];
+						ty += wy[i];
+						++tn;
+					}
+				g_cam_tight = tn;
+				if (tn >= 3 && tn * 2 >= m)
+				{
+					g_cam_x = static_cast<float>(tx / tn);
+					g_cam_y = static_cast<float>(ty / tn);
+					g_cam_exact = true;
+				}
+			}
 			// enough of the distinct sprites agree, or it is not trusted
 			g_cam_known = best >= 3 && best * 10 >= total * 3;
+			stage_shifts();
 			g_cam_matches = total;
 			g_cam_best = best;
+		}
+
+		// 1.3 beta 5: per stage, each sprite against the nearest same-looking sprite of last frame within 2.5 px of where
+		// the camera puts it (repeated sprites included: alt-mode icons, belts). The residual (its shift minus the camera's)
+		// in 0.25 px bins; the most common one and its share.
+		void stage_shifts()
+		{
+			for (auto &st : g_stage)
+				st = {};
+			if (!g_stage_on || !g_cam_known || !g_cam_exact)
+				return;
+			std::unordered_map<uint64_t, std::vector<uint32_t>> prev_by_key;
+			prev_by_key.reserve(g_cam_prev.size());
+			for (uint32_t j = 0; j < g_cam_prev.size(); ++j)
+			{
+				std::vector<uint32_t> &v = prev_by_key[g_cam_prev[j].key];
+				if (v.size() < 256)
+					v.push_back(j);
+			}
+			std::map<std::pair<int, int>, int> hist[4];
+			std::map<std::pair<int, int>, std::pair<double, double>> sums[4]; // per bin: summed residuals (exact mean)
+			int n[4] = {};
+			size_t work = 0;
+			for (const cam_sprite &c : g_cam_cur)
+			{
+				if (c.stage < 1 || c.stage > 3)
+					continue;
+				const auto it = prev_by_key.find(c.key);
+				if (it == prev_by_key.end())
+					continue;
+				float best_d = 6.25f, brx = 0, bry = 0;
+				for (uint32_t j : it->second)
+				{
+					const cam_sprite &p = g_cam_prev[j];
+					const float rx = (c.x - p.x) - g_cam_x, ry = (c.y - p.y) - g_cam_y;
+					const float d = rx * rx + ry * ry;
+					if (d < best_d)
+					{
+						best_d = d;
+						brx = rx;
+						bry = ry;
+					}
+				}
+				work += it->second.size();
+				if (best_d < 6.25f)
+				{
+					const std::pair<int, int> bin = { static_cast<int>(std::lround(brx * 4.0f)), static_cast<int>(std::lround(bry * 4.0f)) };
+					++hist[c.stage][bin];
+					auto &sm = sums[c.stage][bin];
+					sm.first += brx;
+					sm.second += bry;
+					++n[c.stage];
+				}
+				if (work > 400000)
+					break;
+			}
+			for (int s = 1; s <= 3; ++s)
+			{
+				int top = 0;
+				std::pair<int, int> at = { 0, 0 };
+				for (const auto &kv : hist[s])
+					if (kv.second > top)
+					{
+						top = kv.second;
+						at = kv.first;
+					}
+				const auto zero = hist[s].find({ 0, 0 });
+				g_stage[s].n = n[s];
+				// the exact mean of the most common bin (Factorio's positions are floats; the bin only groups them)
+				g_stage[s].dx = top > 0 ? static_cast<float>(sums[s][at].first / top) : 0.0f;
+				g_stage[s].dy = top > 0 ? static_cast<float>(sums[s][at].second / top) : 0.0f;
+				g_stage[s].share = n[s] > 0 ? static_cast<float>(top) / static_cast<float>(n[s]) : 0.0f;
+				g_stage[s].share_zero = n[s] > 0 && zero != hist[s].end() ? static_cast<float>(zero->second) / static_cast<float>(n[s]) : 0.0f;
+			}
 		}
 
 		float overlap(float ax0, float ay0, float ax1, float ay1, float bx0, float by0, float bx1, float by1)
@@ -835,12 +959,6 @@ float4 ps_overlay(float4 pos : SV_Position) : SV_Target
 				h = mix(h, std::llround(s.v[k] * 16384.0f));
 			}
 			return h;
-		}
-
-		float dist_to_rect(float px, float py, const sprite &s)
-		{
-			const float dx = std::max(0.0f, std::max(s.x0 - px, px - s.x1)), dy = std::max(0.0f, std::max(s.y0 - py, py - s.y1));
-			return std::sqrt(dx * dx + dy * dy);
 		}
 
 		int pick()
@@ -963,7 +1081,13 @@ float4 ps_overlay(float4 pos : SV_Position) : SV_Target
 					if (b.target != 0 || b.glow)
 						continue;
 					const float size = std::max(b.x1 - b.x0, b.y1 - b.y0);
-					if (dist_to_rect(cx, cy, b) > std::max(8.0f, size) || g_body_known.count(region_key(b)) == 0)
+					// 1.3: where the camera is centred on it, like the colour layer. Beta 1 took any known animation frame
+					// within its own size of the centre - every character shares them, so another one walking past (in
+					// multiplayer, or in the main menu's demo) was followed off the centre while the camera stood still.
+					const float side = std::max(0.0f, std::max(b.x0 - cx, cx - b.x1));
+					if (side > std::max(6.0f, 0.35f * size) || b.y0 - cy > std::max(6.0f, 0.35f * size) || cy - b.y1 > 1.2f * size)
+						continue;
+					if (g_body_known.count(region_key(b)) == 0)
 						continue;
 					if (g_char_size > 0.0f && (size > 2.0f * g_char_size || size < 0.5f * g_char_size))
 						continue;
@@ -1337,6 +1461,21 @@ float4 ps_overlay(float4 pos : SV_Position) : SV_Target
 	bool enabled() { return g_enabled && !g_failed; }
 	ID3D11Texture2D *mask() { return g_mask; }
 	bool valid() { return g_valid; }
+	void set_stage_shifts(bool on) { g_stage_on = on; }
+
+	camera_info camera()
+	{
+		camera_info c;
+		c.known = g_cam_this_frame && g_cam_known;
+		c.exact = c.known && g_cam_exact;
+		c.dx = g_cam_x;
+		c.dy = g_cam_y;
+		c.support = g_cam_best;
+		c.tight = g_cam_tight;
+		for (int s = 0; s < 4; ++s)
+			c.stage[s] = c.known ? g_stage[s] : camera_info::stage_shift{};
+		return c;
+	}
 	const char *status() { return g_status; }
 	frame_costs last_costs() { return g_costs; }
 
@@ -1622,6 +1761,7 @@ float4 ps_overlay(float4 pos : SV_Position) : SV_Target
 		g_costs.draw_ms = static_cast<float>(qpc_ms(g_draw_ticks));
 		g_costs.own_maps = g_own_maps;
 		g_costs.copy_all = g_copy_all > 0;
+		g_cam_this_frame = false;
 		if (!enabled() || device == nullptr || context == nullptr || width == 0 || height == 0)
 		{
 			release_draws();
@@ -1654,6 +1794,7 @@ float4 ps_overlay(float4 pos : SV_Position) : SV_Target
 		flush_all(context); // the rest of the frame's vertices: still in the buffer
 		read_sprites();
 		find_camera();
+		g_cam_this_frame = true;
 		const int picked = pick();
 		int shadow = 0;
 		uint8_t shadow_on = 0;

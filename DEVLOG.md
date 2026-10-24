@@ -1237,3 +1237,164 @@ Release: version stage "release" (shown as plain 1.2.0); the mask section is cal
 button, the automatic sprite_mask_N.txt dumps and the sprite probe only with *Show developer tools*; the stutter log
 stays on (small, and the README points to it). CHANGELOG has a 1.2.0 release row above the betas; RELEASE_NOTES.md is
 the GitHub release text. Built both variants (MinGW check; the user builds with MSVC).
+
+## 1.3 planning
+
+docs/ROADMAP.md: 1.3 is about the information frame generation is given. What it gets today: motion vectors from
+the GPU estimate (exact only for the character), two-to-three-level layer depth, a binary UI layer (final != HUD-less,
+plus the held character and shadow), identity camera matrices for both DLSS-G and FSR. Planned: a motion-fit measure
+(previous frame warped by our vectors vs the new one, per layer) and recordings first; then motion from sprites for
+everything (moved with the camera / animated in place / own motion), draw-order depth within layers, shadows of
+moving things, UI alpha and cursor-attached things, the light map (the character's light at night), real orthographic
+camera constants (kept only if measured better), and FSR multi-frame generation once AMD ships it (the dispatch
+callback already passes numGeneratedFrames / outputs[4] through). Mod and modpack support moved to 1.4; our own
+multi-frame generator and Linux to later.
+
+## 1.3.0 beta 1
+
+User report: a circle around the character that distorts elevated rails, power lines and buildings near the player,
+zoomed out, "like an invisible force field" (minimal in 1.2). Cause: the still zone (radius 0.25 screen heights, so
+half the screen height across). cs_block may pick "still" (zero) there; with the exact mask cs_expand turned still
+pixels outside the character into the camera only when |cam| >= 1 half-res px. Zoomed out, running moves the camera
+1-2 full-res px per frame, under that limit, and thin high-contrast lines match zero about as well as the sub-pixel
+shift - so they kept zero motion inside the circle. Now still outside the character always becomes the camera (exact
+mask only; without it the 1.1 still-zone logic is unchanged). Shaders: all entry points compile with dxc, fxc lint ok.
+
+Alt-mode module rows with DLSS-G (blur on diagonal moves, jitter zoomed in) while FSR 2x keeps them apart: icons
+already take the camera's motion (beta 36). Either our sub-pixel camera is off (FSR would hide it better), or DLSS-G's
+own optical flow aliases on the repeating icons. To tell apart: compare with motion vectors off, and in 1.3 take the
+camera from the sprites (exact float positions) and log its difference to the image camera.
+
+## 1.3.0 beta 2
+
+Beta 1 test: with motion vectors off the module rows jitter and blur more, so our vectors help DLSS-G there; what is
+left is either their sub-pixel error or DLSS-G's own flow mixing in. Log: sprite_mask_6..18 ("character lost") show a
+static camera (the same building sprites at the same places for 8 s) and characters with the locked colour walking
+away from the centre - the main menu's demo, most likely. The body found by a known animation frame (no colour layer)
+only had to lie within its own size of the centre, so another character was followed off the centre; now it must sit
+where the camera is centred, with the colour layer's rule (also matters in multiplayer: every character shares the
+animation frames). The 40 ms stutters at 60 fps all coincide with Streamline's "flipMetering ... FC feedback: 1"
+lines and are outside the add-on's own time.
+
+- sprite_mask: find_camera refines the shift to the static sprites: median of the best 3x3-bin window, mean of the
+  deltas within 0.05 px of it when they are at least half the window ("exact"); camera() exposes it (known only for
+  the frame just ended).
+- motion: flag 524288 + constant sprite_cam (previous minus current, full-res px). cs_global_final keeps the picture's
+  fit in [6].w / [7].w and uses sprite_cam as t when |a - 1| < 0.0005. The CPU compares the two two frames later
+  (camera moving >= 0.5 px): smoothed mean difference and share of frames over 0.25 px.
+- motion: cs_fit after cs_expand (every 2nd full-res pixel each way, character and its shadow left out): |luma - luma
+  of the previous frame at p + v| with our vectors and with the camera alone, per layer class, summed per group in
+  shared memory; stats[160..177], STATS_BYTES 768; smoothed on the CPU.
+- readout: "Camera source" and "Motion fit" lines; setting CameraFromSprites (on).
+Shaders: all 18 entry points compile with dxc, fxc lint ok. Both variants build (MinGW).
+
+## 1.3.0 beta 3
+
+Beta 2 readout while running past labs and modules: camera from the sprites (exact), picture fit 0.02 px off on
+average, 0 % of 10125 frames over 0.25 px; motion fit ours = camera alone in every layer (ground 0.01, floor 0.15,
+objects 0.17, icons 0.21, flying 0.29; x100 mean luma difference). So our camera was never the problem and the
+vectors explain the frames; the module / science-pack rows blurring together with DLSS-G (worse zoomed out, sideways
+moves) come from frame generation itself. Inputs that could still steer it: depth. Icons had 0.15 vs buildings
+0.25 (FSR 0.4 vs 0.5): an edge around every icon, from the half-res layer mask (coarse zoomed out). Flag 1048576:
+icons at the building's depth (DEPTH_NEAR / FSR 0.5); setting IconDepthOfBuilding (on). If that does not help, the
+next experiment is the icons laid over from the real frame (they would step with Factorio's frames).
+
+## 1.3.0 beta 4
+
+User: since beta 2 all alt-mode icons pulse-blur when moving left / right (beta 1 fine); beta 3's icon depth changes
+nothing. Diff beta 1 -> 2 that can reach the picture: the sprite camera override in cs_global_final (t = sprite_cam,
+a = 1 when |a - 1| < 0.0005) and the cs_fit pass (reads only; GPU time). The readout said the picture fit is 0.02 px
+from the sprites on average, which should make the override invisible - unless single frames differ (the average and
+the 0.25 px share are smoothed) or the extra GPU time upsets DLSS-G's pacing at 4x on the RTX 3080. Beta 4 makes each
+switchable (MeasureMotionFit) and adds a camera trace (motion::trace_start / trace_take, 300 frames, CSV: sprites'
+exact flag / used / support / tight / shift, the picture's own fit, zoom, match, the t actually used).
+
+## 1.3.0 beta 5
+
+Beta 4 camera trace (running left / right, 300 frames): the sprites' shift is a whole number of pixels every frame:
+7, 7, 7, 7, 7, 7, 7, 7, 7, 6 (repeating, 6.9 px per frame on average) - Factorio places the world on the pixel grid.
+The picture's fit agrees (within 0.05 px), but its match drops from about 0.78 to 0.55 in exactly the 6-px frames:
+part of the picture did not move by 6 then. The user also retracts "since beta 2": the pulse is older, most visible
+fully zoomed out (fewer px per frame, so a one-pixel difference is a large part of the step) and only sideways.
+Suspects: (a) alt-mode icons placed on their own (rounded separately, or not rounded) so they move 7 while the world
+moves 6 - frame generation then gets the camera's 6 for them and blends; (b) the uneven 7/6 steps themselves.
+- sprite_mask: cam sprites carry their stage; stage_shifts() matches every sprite (repeated ones too: icons, belts)
+  to the nearest same-key sprite of last frame within 2.5 px of where the camera puts it, histogram of the residual
+  (0.25 px bins), most common bin with the exact mean of its members, its share, the share at zero.
+- motion: flag 2097152 + icon_cam: icon pixels (layer mask) get the air stage's own shift when at least 8 of its
+  sprites were matched and half of them agree. Setting IconMotionFromSprites (on).
+- trace: per stage n / residual x / residual y / share, and whether the icon shift was used.
+If the trace shows the icons moving with the world, (b) is the cause: then the frames themselves step unevenly and
+the remedy would be smoothing the camera (a sub-pixel shift of the world per frame), a larger change.
+
+## 1.3.0 beta 6
+
+Beta 5 traces (the two files the user sent are identical - one sideways run): floor, objects and air stage all
+move exactly with the camera (most common residual 0.00, 0.00 in every one of 244 moving frames; shares 0.91 / 0.97 /
+0.89). The icons are not a pixel off; suspect (a) is out. The steps are 7 x 9 then 6 (6.9 px per frame), and the
+picture's match is 0.58 on the 6-px frames against 0.77 on the 7-px ones. User: no blur or pulse at all moving up and
+down; with the icon option "might be slightly better" - it cannot have changed anything (residual 0), so that is
+noise. What remains: the uneven steps of the real frames, seen through DLSS-G on rows of identical icons along the
+direction of motion (science packs in a lab sit side by side; vertically there is no such dense repeat).
+Stutter log: the mask at present went from ~0.5 to ~1.3 ms with stage_shifts(); now opt-in
+(sprite_mask::set_stage_shifts: icon option or a trace running). Icon option off by default (new key
+IconMotionFromSprites2).
+
+## 1.3.0 beta 7
+
+Menu reorganised (user request) and the camera trace fix: beta 4-6 polled bridge::camera_trace_take() inside the
+Motion vectors tab's drawing, so a trace that finished with the overlay closed, or with another tab or the section
+collapsed, stayed unwritten until that tab was drawn again - and each save overwrote camera_trace.csv (the two
+"different" traces the user sent were the same file). Now: the button only sets a request; save_camera_trace() on the
+present thread starts the trace there (motion state is only touched on that thread), writes it when complete as
+camera_trace_N.csv (next free N), logs the path, and gives up with a message if frame generation stops first. The
+button shows frames left. Settings layout: SeparatorText sections on the Frame generation tab; Motion vectors tab:
+Status / Motion vectors / collapsible Character tracking, Trains-cars-bots, Alt-mode icons (+ air split), Fine
+tuning, Debug views (+ flip sign), developer Recordings (motion fit toggle, camera trace, mask dump, sprite probe).
+docs/HOW_IT_WORKS.md settings tables follow the new sections.
+
+## 1.3.0 beta 8
+
+Beta 7 traces (now two different files): sideways 7 x 9 then 6; up / down exactly the same pattern (0, 7 ... 0, 6)
+- yet the user sees no pulse moving up and down. So the uneven steps are everywhere and the pulse needs rows of
+identical icons along the motion (a lab's science packs sit side by side). Every stage moves exactly with the camera
+again. The lower picture match on 6-px frames (0.57 vs 0.78) is the coarse search's 8-px grid: 7 px is 1 px from
+its nearest point, 6 px 2 px - not a real mismatch. Diagonal: (5, -5) with an occasional (5, -4) / (4, -5).
+Stutter log: in the main menu's demo (12612 draws, copy at every draw) the mask took 8.7 ms while drawing and 3.3 ms
+at present - the known zoomed-out cost; to address with the sprite work.
+Even steps (option EvenSteps, off by default):
+- bridge: per axis o += mean(last <= 30 steps) - step, clamped to +-0.5 px; history reset when a step is more than
+  1.5 px off the mean (speed change, turn) or the sprite camera is not exact (zoom, cut); o decays by half per frame
+  when not valid. Simulated on 7 x 9, 6: the shown step is 6.9 every frame after about three cycles.
+- ui_layer: an extra pass (when on): the clean / HUD-less frame resampled at p - o (Catmull-Rom 4x4) -> "even", and
+  even with the UI layer over it -> "composite". clean_texture() returns even, so DLSS-G's HUD-less tag and FSR's back
+  buffer copy use it; for DLSS-G the composite is copied into the back buffer (the real frame it presents).
+- motion: flag 4194304 + even_delta (previous minus current offset) added to every vector except held pixels (the
+  character); cs_fit subtracts it again (the fit is measured on the frames as drawn).
+
+## 1.3.0 beta 9
+
+Beta 8 test: even steps made quick direction changes leave large artifacts from earlier frames and did not help the
+modules - reverted (src back to beta 7 plus the readout below). User's zoom table (DLSS-G 4x, alt mode, sideways):
+no issue at zoom levels 0, 1, 8, 18, 20; jitter / blur / pulsing blur at others, worst fully zoomed out - not
+monotonic in zoom. Hypothesis: Factorio's frames are pixel-exact (the world moves by whole pixels), but a generated
+frame at 1/4, 1/2, 3/4 of a step of s px puts it at s/4, s/2, 3s/4 - between pixels unless s is a multiple of 4. There
+frame generation resamples, and one-pixel-wide icon detail goes soft in generated frames and sharp again in real ones:
+blur / jitter, strongest along the direction of motion (icons in a row merge when moving sideways). The step depends on
+zoom (and alternates, 7 ... 7, 6), hence the table and the pulse. Readout line to test it: the in-between positions
+and whether they are whole pixels. If it holds, the remedy is in-between frames that move the world by whole pixels -
+which DLSS-G / FSR do not do (one motion field, fixed fractions) - i.e. a frame generator of our own (roadmap).
+
+## 1.3 finding: pixel-exact frames
+
+Beta 9 readout test (user): the blur / jitter appears exactly when the in-between positions flip between "whole
+pixels" and "between pixels"; fully zoomed out they are between pixels most of the time and flip fast - slight blur
+and jitter there. Confirmed: the artifacts come from DLSS-G resampling Factorio's pixel-exact frames at fixed
+fractions of an integer step. Roadmap: 1.4 becomes a pixel-exact frame generator of our own (integer shifts per
+in-between frame, our own pacing); mods move to 1.5.
+
+## 1.3.0 release
+
+Version stage "release" (shown as plain 1.3.0). CHANGELOG release row above the betas; RELEASE_NOTES.md rewritten for
+1.3.0; README "Good to know" and HOW_IT_WORKS "Known limits" explain the alt-mode icon blur (pixel-exact frames
+resampled between pixels) and point to the roadmap. Both variants build (MinGW check).

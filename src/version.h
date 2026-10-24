@@ -4,10 +4,10 @@
 #pragma once
 
 #define ADDON_VERSION_MAJOR 1
-#define ADDON_VERSION_MINOR 2
+#define ADDON_VERSION_MINOR 3
 #define ADDON_VERSION_PATCH 0
-#define ADDON_VERSION_STRING "1.2.0"
+#define ADDON_VERSION_STRING "1.3.0"
 #define ADDON_VERSION_STAGE "release"
-#define ADDON_VERSION_FULL "1.2.0"
+#define ADDON_VERSION_FULL "1.3.0"
 // Shown in the on-screen readout: the version plus the stage while it is not a release ("" for releases).
-#define ADDON_VERSION_SHOWN "1.2.0"
+#define ADDON_VERSION_SHOWN "1.3.0"

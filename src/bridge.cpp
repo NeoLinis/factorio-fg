@@ -15,6 +15,7 @@
 #include <dxgi1_6.h>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 
 namespace
 {
@@ -650,6 +651,52 @@ namespace bridge
 		motion::block_shares(camera, still, own);
 	}
 
+	const char *camera_line()
+	{
+		static char buf[200];
+		const motion::camera_check c = motion::camera_compare();
+		const char *src = c.used_last ? "Factorio's sprites (exact)" : (c.wanted ? "the picture (sprites not exact now)" : "the picture");
+		if (c.frames == 0)
+			std::snprintf(buf, sizeof(buf), "%s | picture vs sprites: not compared yet (move the camera)", src);
+		else
+			std::snprintf(buf, sizeof(buf), "%s | picture vs sprites: %.2f px off on average, %.0f%% of frames over 0.25 px (%u frames)",
+				src, c.mean_diff, c.share_off * 100.0f, c.frames);
+		return buf;
+	}
+
+	bool camera_trace_start(uint32_t frames)
+	{
+		return motion::trace_start(frames);
+	}
+
+	int camera_trace_left()
+	{
+		return motion::trace_left();
+	}
+
+	bool camera_trace_take(std::string &out)
+	{
+		return motion::trace_take(out);
+	}
+
+	const char *fit_line()
+	{
+		static char buf[240];
+		motion::fit_info f;
+		if (!motion::motion_fit(f))
+		{
+			std::snprintf(buf, sizeof(buf), "Motion fit: -");
+			return buf;
+		}
+		// per layer: mean luma difference (x100) after moving the previous frame by our vectors, and by the camera alone
+		static const char *const names[6] = { "ground", "floor", "objects", "icons", "flying", "all" };
+		int n = std::snprintf(buf, sizeof(buf), "Motion fit (lower = better; camera alone):");
+		for (int i = 0; i < 6 && n > 0 && n < static_cast<int>(sizeof(buf)); ++i)
+			if (f.share[i] >= 0.002f)
+				n += std::snprintf(buf + n, sizeof(buf) - n, " %s %.3f (%.3f)", names[i], f.ours[i] * 100.0f, f.camera[i] * 100.0f);
+		return buf;
+	}
+
 	uint32_t frames_per_present()
 	{
 		if (s == nullptr)
@@ -856,6 +903,19 @@ namespace bridge
 				ms.icons_first = options.motion_icons_first;
 				ms.wide_search = options.motion_wide_search;
 				ms.floor_camera = options.motion_floor_camera;
+				ms.sprite_camera = options.motion_sprite_camera;
+				ms.icon_depth_flat = options.motion_icon_depth_flat;
+				ms.fit_measure = options.motion_fit_measure;
+				ms.sprite_camera_support = options.sprite_camera_support;
+				ms.sprite_camera_tight = options.sprite_camera_tight;
+				ms.icon_motion = options.motion_icon_motion;
+				ms.icon_shift_valid = options.icon_shift_valid;
+				ms.icon_dx = options.icon_dx;
+				ms.icon_dy = options.icon_dy;
+				std::memcpy(ms.stage_diag, options.stage_diag, sizeof(ms.stage_diag));
+				ms.sprite_camera_valid = options.sprite_camera_valid;
+				ms.sprite_camera_dx = options.sprite_camera_dx;
+				ms.sprite_camera_dy = options.sprite_camera_dy;
 				ms.spread_depth = fg::current() == fg::backend::fsr;
 				ms.hold_as_ground = options.fg_hold_character && options.fg_inpaint_character && !options.fg_show_ui_layer &&
 					options.fg_multiplier > 1 && !options.motion_debug_view;

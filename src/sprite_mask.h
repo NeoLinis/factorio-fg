@@ -59,6 +59,22 @@ namespace sprite_mask
 	                           // earlier frame at an estimated place)
 	                           // (null before the first frame)
 	bool valid();              // the last frame_end() produced a mask
+	// 1.3: the camera shift of the last frame_end() from the world sprites (this frame's top-left corners minus last
+	// frame's, full-res px, for sprites whose texture region and size appear once in both). 'exact': most of them agree
+	// within 0.05 px (Factorio's own float positions), so this is the camera's shift itself. Unknown while zooming
+	// (sizes change) or with too few sprites.
+	struct camera_info
+	{
+		bool known = false, exact = false; float dx = 0, dy = 0; int support = 0, tight = 0;
+		// 1.3 beta 5: per world stage (1 floor, 2 objects, 3 air: alt-mode icons, bots), how its sprites moved relative to
+		// the camera: the most common residual (0.25 px steps), its share, the share that moved exactly with the camera,
+		// and how many sprites were matched
+		struct stage_shift { int n = 0; float dx = 0, dy = 0, share = 0, share_zero = 0; };
+		stage_shift stage[4];
+	};
+	camera_info camera();
+	// 1.3 beta 6: measure the per-stage shifts (camera_info::stage) - for the icon option and the camera trace only.
+	void set_stage_shifts(bool on);
 	const char *status();
 	// CPU cost of the last finished frame on Factorio's render thread (for the stutter readout).
 	struct frame_costs
